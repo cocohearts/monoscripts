@@ -1,7 +1,8 @@
 # %%
 from PIL import Image
 import numpy as np
-from tqdm.notebook import tqdm, trange
+from tqdm import tqdm, trange
+# from tqdm.notebook import tqdm, trange
 
 import os
 import torch
@@ -10,6 +11,7 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from accelerate import Accelerator, notebook_launcher
 import clip
+import ipywidgets as widgets
 
 # %%
 # if __name__ == "__main__":
@@ -255,6 +257,9 @@ class SANA_VAE(nn.Module):
     def split_code(self, x):
         return x[:, :x.shape[1]//2], x[:, x.shape[1]//2:]
 
+    def get_encoder_output(self, x):
+        return self.encoder(x)
+
     def encode(self, x, eps=None):
         output = self.encoder(x)
         mu, logvar = self.split_code(output)
@@ -276,7 +281,7 @@ class SANA_VAE(nn.Module):
     
     def train_step(self, batch, optimizer, clip_model, resize):
         optimizer.zero_grad()
-        encoded_info = self.encoder(batch)
+        encoded_info = self.get_encoder_output(batch)
         mu, logvar = self.split_code(encoded_info)
         eps = torch.randn_like(mu)
         encoded = mu + eps * torch.exp(logvar)
@@ -293,20 +298,41 @@ class SANA_VAE(nn.Module):
         optimizer.step()
         return loss.item()
 
-    def train(self, dataloader, optimizer, clip_model, resize, epochs=100):
+    def train(self, dataloader, optimizer, clip_model, resize, epochs=100, accelerator=None):
         best_loss = float('inf')
-        for _ in trange(epochs, desc="Epochs", leave=True):
+        # Get process info from accelerator
+        is_main_process = accelerator.is_main_process
+        progress_bar = tqdm(range(epochs), 
+                           desc=f"Training (process {accelerator.process_index})", 
+                           position=accelerator.process_index*2,
+                           leave=True,
+                           disable=not is_main_process)
+        batch_progress = tqdm(total=len(dataloader), 
+                             desc=f"Batches (process {accelerator.process_index})", 
+                             position=accelerator.process_index*2+1,
+                             leave=True,
+                             disable=not is_main_process)
+        
+        for _ in progress_bar:
             epoch_loss = 0
-            for batch in tqdm(dataloader, desc="Batches", leave=True):
+            batch_progress.reset()
+            
+            for batch in dataloader:
                 batch = batch.to(next(self.parameters()).device)
                 loss = SANA_VAE.train_step(self, batch, optimizer, clip_model, resize)
                 epoch_loss += loss
+                batch_progress.update(1)
+                
             epoch_loss /= len(dataloader)
-            print(f"Loss: {epoch_loss}")
+            progress_bar.set_postfix({'loss': f'{epoch_loss:.4f}'})
+            
             if epoch_loss < best_loss:
                 best_loss = epoch_loss
-                torch.save(self.state_dict(), "sana_vae.pt")
-        print(f"Best loss: {best_loss}")
+                if is_main_process:
+                    torch.save(self.state_dict(), "sana_vae.pt")
+        
+        if is_main_process:
+            print(f"Best loss: {best_loss}")
 
 # %%
 def num_params(model):
@@ -328,6 +354,8 @@ def num_params(model):
 
 # %%
 def training_function():
+    # Make accelerator global so it's accessible in the train method
+    global accelerator
     accelerator = Accelerator()
 
     dataloader = get_dataloader(batch_size=256)
@@ -341,7 +369,7 @@ def training_function():
     model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
     model = torch.compile(model)
 
-    SANA_VAE.train(model, dataloader, optimizer, clip_model, resize, epochs=10)
+    SANA_VAE.train(model.module, dataloader, optimizer, clip_model, resize, epochs=3, accelerator=accelerator)
 
 # %%
 os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3,4,5,6,7'

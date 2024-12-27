@@ -1,4 +1,5 @@
 # %%
+import wandb
 import torch
 import torch.nn as nn
 from torch import Tensor
@@ -8,7 +9,6 @@ import torchvision.transforms as transforms
 import matplotlib.pyplot as plt
 import numpy as np
 
-from tqdm.notebook import tqdm
 from typing import Callable
 from jaxtyping import Float, Int
 import einops
@@ -17,10 +17,11 @@ from torch.utils.data import DataLoader
 from accelerate import Accelerator
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, TensorDataset, Dataset
 from accelerate import Accelerator, DistributedDataParallelKwargs, notebook_launcher
-from torch.profiler import profile, record_function, ProfilerActivity
 import ipywidgets as widgets
+from datasets import load_dataset, DownloadConfig
+from transformers import AutoTokenizer
 
 # %%
 import dotenv
@@ -28,38 +29,92 @@ from datasets import load_dataset
 from transformers import AutoTokenizer
 import os
 dotenv.load_dotenv()
-import huggingface_hub
-HUGGINGFACE_API_KEY = os.getenv("HUGGING_FACE_API_KEY")
-huggingface_hub.login(token=HUGGINGFACE_API_KEY)
+# import huggingface_hub
+# HUGGINGFACE_API_KEY = os.getenv("HUGGINGFACE_API_KEY")
+# huggingface_hub.login(token=HUGGINGFACE_API_KEY)
 
-# Login using e.g. `huggingface-cli login` to access this dataset
+
 # ds = load_dataset("bigcode/the-stack-v2", cache_dir="/shared/alex-zhao-storage/the-stack-v2", split="train")
-tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased", cache_dir="/shared/alex-zhao-storage/hf-cache")
+# tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-11b-Vision", cache_dir="/shared/alex-zhao-storage/hf-cache")
+tokenizer = AutoTokenizer.from_pretrained("gpt2", cache_dir="/shared/alex-zhao-storage/hf-cache")
+tokenizer.pad_token_id = tokenizer.eos_token_id
+# tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased", cache_dir="/shared/alex-zhao-storage/hf-cache")
+# tokenizer.vocab_size
+# torch._logging.set_log_level("ERROR")
+
+# %%
+def is_in_notebook():
+    try:
+        from IPython import get_ipython
+        if get_ipython() is not None and 'IPKernelApp' in get_ipython().config:
+            return True
+        return False
+    except ImportError:
+        return False
+
+if is_in_notebook():
+    from tqdm.notebook import tqdm
+else:
+    from tqdm import tqdm
+
+# %%
+def num_params(model):
+    return sum(p.numel() for p in list(model.parameters()))
+
+# %%
+debug = False
+if debug:
+    print(tokenizer.decode(tokenizer.encode("hello there, happy world! test lol lol")))
+
+# %%
+# ds = load_dataset("HuggingFaceFW/fineweb-edu", "default")
+# L = torch.load('/shared/alex-zhao-storage/tiny-textbook-ds.pt')
+# dataloader = DataLoader(L['input_ids'], batch_size=32, num_workers=8)
+class TextDataset(Dataset):
+    def __init__(self, text, tokenizer):
+        self.text = text
+        self.tokenizer = tokenizer
+
+    def __len__(self):
+        return len(self.text)
+    
+    def __getitem__(self, idx):
+        output = self.tokenizer.encode(self.text[idx], return_tensors="pt", padding=True, truncation=True, padding_side="left", max_length=512)
+        # Squeeze to remove batch dimension added by tokenizer
+        output = output.squeeze(0)
+
+        # Pad to length 513 from the left if needed
+        padding_length = 512 - output.size(0)
+        padding = torch.full((padding_length,), self.tokenizer.pad_token_id)
+        output = torch.cat([padding, output], dim=0)
+            
+        return output
+    
+def get_dataloader(batch_size=16, accelerator=None):
+    # tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased", cache_dir="/shared/alex-zhao-storage/hf-cache")
+    # dataset = load_dataset("nampdn-ai/tiny-textbooks", cache_dir="/shared/alex-zhao-storage/hf-cache")
+    is_main_process = accelerator is None or accelerator.is_main_process
+    if not is_main_process:
+        dataset = load_dataset("DKYoon/SlimPajama-6B", cache_dir="/shared/alex-zhao-storage/hf-cache", split="train", download_config=DownloadConfig(disable_tqdm=True))
+    else:
+        dataset = load_dataset("DKYoon/SlimPajama-6B", cache_dir="/shared/alex-zhao-storage/hf-cache", split="train")
+    return DataLoader(TextDataset(dataset['text'], tokenizer), batch_size=batch_size, num_workers=0)
+
+# %%
+if debug:
+    dataloader = get_dataloader()
+    for batch in dataloader:
+        print(batch.shape)
+        break
 
 # %%
 tokenizer.vocab_size
-
-# %%
-# device = torch.device("cuda")
-
-# a utility for calculating running average
-class AverageMeter():
-    def __init__(self):
-        self.num = 0
-        self.tot = 0
-
-    def update(self, val: float, sz: float):
-        self.num += val*sz
-        self.tot += sz
-
-    def calculate(self) -> float:
-        return self.num/self.tot
 
 # %% [markdown]
 # # Prefix Ops
 
 # %%
-from math import log2
+from math import log2, ceil
 class PrefixOps():
     # Assumes that position is a power of 2
     def pref_mul(t: Float[Tensor, "batch position d_model d_state"]):
@@ -81,7 +136,9 @@ class PrefixOps():
         return down_tensors[-1] * t
 
     def pref_add(t: Float[Tensor, "batch position d_model d_state"]):
-        n_layers = int(log2(t.shape[1]))
+        n_layers = ceil(log2(t.shape[1]))
+        len_diff = 2**n_layers - t.shape[1]
+        t = torch.cat([t, torch.zeros(t.shape[0], len_diff, t.shape[2], t.shape[3]).to(t.device)], dim=1)
         up_tensors = []
         down_tensors = []
         up_tensors.append(t)
@@ -96,7 +153,8 @@ class PrefixOps():
             new[:, ::2] = down_tensors[-1]
             new[:, 1::2] = down_tensors[-1] + up_tensors[-2 - index][:, ::2]
             down_tensors.append(new)
-        return down_tensors[-1] + t
+        output = down_tensors[-1] + t
+        return output[:, :t.shape[1] - len_diff]
 
 class TestPrefixOps():
     def __init__(self, batch, position, d_model, d_state):
@@ -137,7 +195,6 @@ TestPrefixOps(12, 64, 768, 64).pref_add()
 # ## Single Head
 
 # %%
-# TODO: generate not supported for pref_sum
 test_ssm_ablation = False
 pref_sum = True
 use_double = False
@@ -175,7 +232,7 @@ class SSM(nn.Module):
 
         assert(str(x.device)[:4] == 'cuda')
 
-        if pref_sum:
+        if pref_sum and not use_hidden:
             Bx = B_bar * x[..., None]
             Bx_log = torch.log(torch.abs(Bx))
             A_bar_prod_log = PrefixOps.pref_add(A_bar_pre)
@@ -192,7 +249,8 @@ class SSM(nn.Module):
                 A_bar_prod_log = torch.max(A_bar_prod_log, Bx_log-70)
                 AinvsB_log = Bx_log - A_bar_prod_log
                 AinvsBsum = PrefixOps.pref_add(torch.exp(AinvsB_log) * torch.sign(Bx))
-                y = torch.matmul((AinvsBsum * torch.exp(A_bar_prod_log)), C[..., None]).squeeze(-1)
+                h = AinvsBsum * torch.exp(A_bar_prod_log)
+                y = torch.matmul(h, C[..., None]).squeeze(-1)
             if torch.isnan(y).any() or torch.isinf(y).any():
                 raise ValueError("NaN or Inf values detected in SSM output")
         else:
@@ -211,7 +269,7 @@ class SSM(nn.Module):
         if torch.isnan(y).any() or torch.isinf(y).any():
             raise ValueError("NaN or Inf values detected in SSM output")
         if keep_hidden:
-            self.h = h
+            self.h = h[:, -1:]
         return y
 
     def device(self):
@@ -357,26 +415,32 @@ class MambaLM(nn.Module):
         super().__init__()
 
         self.vocab_size = vocab_size
-        self.embedding = nn.Embedding(self.vocab_size, d_model)
-        self.embedding.weight.requires_grad = False
+        self.n_layers = n_layers
+        self.n_heads = n_heads
+        self.d_model = d_model
+        self.d_state = d_state
+        self.d_conv = d_conv
+        self.expand = expand
         self.context_len = context_len
 
-        self.pos_embedding = nn.Embedding(context_len, d_model)
-        self.pos_embedding.weight.requires_grad = False
-        self.pos_embedding.weight.data[:, ::2] = torch.sin(torch.arange(0, context_len)[:, None] / 10000 ** (torch.arange(0, d_model, 2)[None, :] / d_model))
-        self.pos_embedding.weight.data[:, 1::2] = torch.cos(torch.arange(0, context_len)[:, None] / 10000 ** (torch.arange(1, d_model, 2)[None, :] / d_model))
+        self.embedding = nn.Embedding(self.vocab_size, d_model)
+
+        self.pos_embedding = nn.Embedding(self.context_len, d_model)
+
+        self.pos_embedding.weight.data[:, ::2] = torch.sin(torch.arange(0, self.context_len)[:, None] / 10000 ** (torch.arange(0, self.d_model, 2)[None, :] / self.d_model))
+        self.pos_embedding.weight.data[:, 1::2] = torch.cos(torch.arange(0, self.context_len)[:, None] / 10000 ** (torch.arange(1, self.d_model, 2)[None, :] / self.d_model))
 
         self.layers = nn.ModuleList([MambaLayer(n_heads, d_model, d_state, d_conv, expand) for _ in range(n_layers)])
-        self.n_heads = n_heads
         self.output_layer = nn.Linear(d_model, self.vocab_size)
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor, keep_hidden=False, use_hidden=False, position_shift=0) -> Tuple[torch.Tensor, torch.Tensor]:
         # Count zeros on left side of each sequence
-        mask = (x == 0).to(self.device())
+        mask = (x == 0).to(next(self.parameters()).device)
         left_zeros = mask.cummin(dim=1)[0].sum(dim=1, keepdim=True)
 
-        pos_embed_indices = torch.arange(x.shape[1]).expand(x.shape[0], -1).to(self.device()) - left_zeros
+        pos_embed_indices = torch.arange(x.shape[1]).expand(x.shape[0], -1).to(next(self.parameters()).device) - left_zeros
         pos_embed_indices = torch.where(pos_embed_indices >= 0, pos_embed_indices, 0)
+        pos_embed_indices += position_shift
         pos_embed = torch.where(pos_embed_indices.unsqueeze(-1) >= 0, self.pos_embedding(pos_embed_indices), 0)
 
         x = self.embedding(x)
@@ -384,7 +448,7 @@ class MambaLM(nn.Module):
         if x.isnan().any() or x.isinf().any():
             raise ValueError("NaN or Inf values detected in MambaLM input")
         for layer in self.layers:
-            x = layer(x)
+            x = layer(x, keep_hidden=keep_hidden, use_hidden=use_hidden)
         x = self.output_layer(x)
         return x
     
@@ -410,11 +474,8 @@ class MambaLM(nn.Module):
         scheduler.step()
         return loss
     
-    def device(self):
-        return next(self.parameters()).device
-
     @staticmethod
-    def train(model, ds, optimizer, scheduler, epochs=3, accelerator=None):
+    def train(model, ds, optimizer, scheduler, epochs=1, accelerator=None, enable_wandb=False):
         best_loss = float('inf')
         is_main_process = accelerator is not None and accelerator.is_main_process
         progress_bar = tqdm(range(epochs), 
@@ -422,7 +483,7 @@ class MambaLM(nn.Module):
                            position=accelerator.process_index*2,
                            leave=True,
                            disable=not is_main_process)
-        batch_progress = tqdm(total=len(ds), 
+        batch_progress = tqdm(ds, 
                              desc=f"Batches (process {accelerator.process_index})", 
                              position=accelerator.process_index*2+1,
                              leave=True,
@@ -434,137 +495,73 @@ class MambaLM(nn.Module):
 
             for index, batch in enumerate(batch_progress):
                 # if accelerator is not None and accelerator.is_main_process:
-                loss = MambaLM.train_step(model, torch.stack(batch, dim=-1).to(next(model.parameters()).device), optimizer, scheduler, accelerator)
+                loss = MambaLM.train_step(model, batch.to(next(model.parameters()).device), optimizer, scheduler, accelerator)
                 epoch_loss += loss.item()
                 batch_progress.update(1)
-                    # print(f"Loss: {loss.item():0.4f}")
-                # else:
-                    # loss = MambaLM.train_step(model, torch.stack(batch, dim=-1).to(model.device()), optimizer, scheduler, accelerator)
-                    # if index % 100 == 0:
-                        # print(f"Loss: {loss.item():0.4f}")
-                if index % 10 == 0 and is_main_process:
-                    batch_progress.set_description(f"Loss: {epoch_loss / (index + 1):0.4f}")
+                batch_progress.set_description(f"Loss: {epoch_loss / (index + 1):0.4f}")
+                if enable_wandb:
+                    wandb.log({"loss": loss.item()})
+
+                # if index % 100 == 0 and is_main_process:
+                #     print(f"Test generation `the weather today is` at {index / len(ds) * 100:.2f}% completion: ", MambaLM.generate_text(model, "the weather today is", 10))
 
             if epoch_loss < best_loss:
                 best_loss = epoch_loss
                 if accelerator is not None and accelerator.is_main_process:
                     torch.save(model.state_dict(), "mamba_lm.pt")
-        
+
         if is_main_process:
             print(f"Best loss: {best_loss:0.4f}")
                     
-            # if accelerator is not None and accelerator.is_main_process:
-            #     print(f"Epoch {_} complete")
-            #     tokens = tokenizer.encode("hello there, happy world!")
-            #     tokens = torch.tensor(tokens).unsqueeze(0).to(model.device())
-            #     tokens = torch.cat([torch.zeros(1, 5, device=model.device(), dtype=tokens.dtype), tokens], dim=1)
-            #     generation = model.forward(tokens)
-            #     print(tokenizer.decode(generation[0].argmax(dim=-1).tolist()))
-
+            
     def generate(self, x: Int[Tensor, "batch position"], new_tokens: int) -> Tuple[torch.Tensor, torch.Tensor]:
         returned = x
+
         out = self.forward(x, keep_hidden=True)
-        next_token = out[:, -1].argmax(dim=-1)
+        next_token = out[:, -1].argmax(dim=-1)[None, :]
         returned = torch.cat([returned, next_token], dim=1)
 
         for _ in range(new_tokens-1):
             out = self.forward(next_token, keep_hidden=True, use_hidden=True)
-            next_token = out[:, -1].argmax(dim=-1)
+            next_token = out[:, -1].argmax(dim=-1)[None, :]
             returned = torch.cat([returned, next_token], dim=1)
         return returned
 
     def generate_text(self, text, new_tokens):
         tokens = tokenizer.encode(text)
-        tokens = torch.tensor(tokens).unsqueeze(0).to(self.device())
-        return tokenizer.decode(self.generate(tokens, new_tokens)[0])
+        tokens = torch.tensor(tokens).unsqueeze(0).to(next(self.parameters()).device)
+        return tokenizer.decode(MambaLM.generate(self, tokens, new_tokens)[0])
 
 # %% [markdown]
 # # Get Data
 
 # %%
-import wget
-import os
-if not os.path.exists("input.txt"):
-    wget.download("https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt")
+# import wget
+# import os
+# if not os.path.exists("input.txt"):
+#     wget.download("https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt")
 
-with open('input.txt', 'r') as f:
-    raw_text = f.read()
-all_dialogues = raw_text.split('\n\n')
-
-# %%
-# type(tokenizer)
+# with open('input.txt', 'r') as f:
+#     raw_text = f.read()
+# all_dialogues = raw_text.split('\n\n')
 
 # %%
-# type(all_dialogues)
-
-# %% [markdown]
-# ## Part 4.A
-
-# %%
-# tokenizer.encode("hello there, happy world!")
-
-# %%
-def num_params(model):
-    return sum(p.numel() for p in list(model.parameters()))
-
-
-# %%
-torch.set_float32_matmul_precision('high')
-
-# %%
-from datasets import load_dataset
-
-# Login using e.g. `huggingface-cli login` to access this dataset
-# ds = load_dataset("nampdn-ai/tiny-textbooks", cache_dir="/shared/alex-zhao-storage/hf-cache")
-
-# %%
-# import numpy as np
-# lengths = [len(text) for text in ds['train']['textbook']]
-# print(f"Number of texts: {len(lengths)}")
-# print(f"Mean length: {np.mean(lengths):.1f}")
-# print(f"Std length: {np.std(lengths):.1f}") 
-# print(f"Min length: {min(lengths)}")
-# print(f"Max length: {max(lengths)}")
-# print(f"Median length: {np.median(lengths):.1f}")
+if debug:
+    ds = load_dataset("nampdn-ai/tiny-textbooks", cache_dir="/shared/alex-zhao-storage/hf-cache")
+    print(tokenizer.encode("hello there, happy world!"))
+    lengths = [len(text) for text in ds['train']['textbook']]
+    print(f"Number of texts: {len(lengths)}")
+    print(f"Mean length: {np.mean(lengths):.1f}")
+    print(f"Std length: {np.std(lengths):.1f}") 
+    print(f"Min length: {min(lengths)}")
+    print(f"Max length: {max(lengths)}")
+    print(f"Median length: {np.median(lengths):.1f}")
 
 # %%
 # L = torch.load('/shared/alex-zhao-storage/tiny-textbook-ds.pt')
-# dataloader = DataLoader(L['input_ids'], batch_size=32, num_workers=8)
-
-# %%
-# model = MambaLM(tokenizer.vocab_size, 
-#                 n_layers=12,
-#                 n_heads=6,
-#                 d_model=192,
-#                 d_state=32,
-#                 d_conv=4,
-#                 expand=2,
-#                 ).to('cuda')
-# print(num_params(model))
-# optimizer = torch.optim.AdamW(model.parameters(), betas=(0.9, 0.95), weight_decay=0.1, lr=0.001)
-# scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100)
-# model = torch.compile(model)
-# MambaLM.train(model, dataloader, optimizer, scheduler, epochs=1)
-
-# %%
-# model = MambaLM(tokenizer.vocab_size, 
-#                 n_layers=12,
-#                 n_heads=6,
-#                 d_model=192,
-#                 d_state=32,
-#                 d_conv=4,
-#                 expand=2,
-#                 ).to('cuda')
-# print(num_params(model))
-# optimizer = torch.optim.AdamW(model.parameters(), betas=(0.9, 0.95), weight_decay=0.1, lr=0.001)
-# scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100)
-# model = torch.compile(model)
-# # L = tokenizer.batch_encode_plus(ds['train']['textbook'], padding=True, truncation=True, max_length=513, padding_side='left', return_tensors='pt').to('cuda')
-# # torch.save(L, '/shared/alex-zhao-storage/tiny-textbook-ds.pt')
-# # dataloader = DataLoader(L['input_ids'], batch_size=32)
-# # L = tokenizer.batch_encode_plus(all_dialogues, padding=True, truncation=True, max_length=65, padding_side='left').to('cuda')
-# # dataloader = DataLoader(L['input_ids'], batch_size=4)
-# model.my_train(dataloader, optimizer, scheduler)
+# special_print(f"Loaded dataset with {len(L['input_ids'])} samples", accelerator)
+# dataloader = DataLoader(L['input_ids'], batch_size=1, num_workers=0)
+# special_print(f"Loaded dataloader with {len(dataloader)} batches", accelerator)
 
 # %%
 def special_print(my_str, accelerator):
@@ -580,76 +577,22 @@ def print_time():
 
 vocab_size = tokenizer.vocab_size
 
-# L = tokenizer.batch_encode_plus(ds['train']['textbook'], padding=True, truncation=True, max_length=513, padding_side='left', return_tensors='pt').to('cuda')
-# torch.save(L, '/shared/alex-zhao-storage/tiny-textbook-ds.pt')
-# dataloader = DataLoader(L['input_ids'], batch_size=32)
-# L = tokenizer.batch_encode_plus(all_dialogues, padding=True, truncation=True, max_length=65, padding_side='left').to('cuda')
-# dataloader = DataLoader(L['input_ids'], batch_size=4)
-
-# model.my_train(dataloader, optimizer, scheduler)
-def training_function(dataloader):
+def training_function():
     accelerator = Accelerator()
     special_print("Accelerator initialized", accelerator)
+    is_main_process = accelerator.is_main_process
+    if is_main_process:
+        wandb.login(key=os.getenv("WANDB_API_KEY"))
+        wandb.init(project="monoscripts-mamba")
+
+    dataloader = get_dataloader(4, accelerator)
+    special_print(f"Loaded dataloader with {len(dataloader)} batches", accelerator)
+    for batch in dataloader:
+        tokens_per_batch = batch.numel()
+        break
+    num_tokens = len(dataloader) * tokens_per_batch
+    special_print(f"Number of tokens: {num_tokens}", accelerator)
     
-    # 4. Prepare with Accelerator
-    # L = torch.load('/shared/alex-zhao-storage/tiny-textbook-ds.pt')
-    # special_print(f"Loaded dataset with {len(L['input_ids'])} samples", accelerator)
-    # dataloader = DataLoader(L['input_ids'], batch_size=4, num_workers=0)
-    # special_print(f"Loaded dataloader with {len(dataloader)} batches", accelerator)
-    # L = tokenizer.batch_encode_plus(all_dialogues, padding=True, truncation=True, max_length=65, padding_side='left').to('cuda')
-    # dataloader = DataLoader(L['input_ids'], batch_size=4)
-
-    model = MambaLM(vocab_size, 
-                n_layers=16,
-                n_heads=16,
-                d_model=512,
-                d_state=32,
-                d_conv=8,
-                expand=4,
-                )
-    
-    special_print(f"Model params: {num_params(model)}", accelerator)
-
-    optimizer = torch.optim.AdamW(model.parameters(), betas=(0.9, 0.95), weight_decay=0.1, lr=0.001)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100)
-
-    model, dataloader, optimizer, scheduler = accelerator.prepare(model, dataloader, optimizer, scheduler)
-    special_print("Prepared with Accelerator", accelerator)
-    model = torch.compile(model)
-    special_print("Model compiled", accelerator)
-
-    epochs = 1
-    progress_bar = None
-    if accelerator.is_main_process:
-        progress_bar = tqdm(total=epochs * len(dataloader), desc="Training Progress")
-        
-    MambaLM.train(model.module, dataloader, optimizer, scheduler, epochs, accelerator)
-    
-    if accelerator.is_main_process:
-        progress_bar.close()
-
-    # 6. Save final model
-    # Must unwrap to gather full weights from all shards
-    unwrapped_model = accelerator.unwrap_model(model)
-    torch.save(unwrapped_model.state_dict(), "my_fsdp_fp32_model.pt")
-    print("Model saved at my_fsdp_fp32_model.pt")
-
-# %%
-# from accelerate.logging import get_logger
-# logger = get_logger(__name__)
-# logger.setLevel("DEBUG")
-
-# %%
-# !export ACCELERATE_DEBUG_MODE=yes
-# import torch.multiprocessing as mp
-
-if __name__ == "__main__":
-    # Set multiprocessing start method to 'spawn'
-    # mp.set_start_method("spawn", force=True)
-
-    # Your main training code here
-    # from accelerate import launch
-    # launch()
     # model = MambaLM(vocab_size, 
     #             n_layers=12,
     #             n_heads=6,
@@ -658,154 +601,83 @@ if __name__ == "__main__":
     #             d_conv=4,
     #             expand=2,
     #             )
-    # model = torch.compile(model)
-    L = torch.load('/shared/alex-zhao-storage/tiny-textbook-ds.pt')
-    print(f"Loaded dataset with {len(L['input_ids'])} samples")
-    dataloader = DataLoader(L['input_ids'], batch_size=4, num_workers=0)
-    print(f"Loaded dataloader with {len(dataloader)} batches")
-    training_function(dataloader)
+
+    model = MambaLM(vocab_size, 
+                n_layers=12,
+                n_heads=12,
+                d_model=768,
+                d_state=64,
+                d_conv=4,
+                expand=2,
+                )
+    
+    special_print(f"Model params: {num_params(model)}", accelerator)
+    special_print(f"Token:params ratio: {num_tokens / num_params(model)}", accelerator)
+
+    optimizer = torch.optim.AdamW(model.parameters(), betas=(0.9, 0.95), weight_decay=0.1, lr=0.001)
+    # optimizer = torch.optim.SGD(model.parameters(), lr=0.001)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100)
+
+    model, dataloader, optimizer, scheduler = accelerator.prepare(model, dataloader, optimizer, scheduler)
+    special_print("Prepared with Accelerator", accelerator)
+    model = torch.compile(model)
+    special_print("Model compiled", accelerator)
+    
+    if is_main_process:
+        wandb.watch(model)
+
+    epochs = 1
+    MambaLM.train(model, dataloader, optimizer, scheduler, epochs, accelerator, enable_wandb=is_main_process)
+    
+    # 6. Save final model
+    # Must unwrap to gather full weights from all shards
+    unwrapped_model = accelerator.unwrap_model(model)
+    torch.save(unwrapped_model.state_dict(), "my_fsdp_fp32_model.pt")
+    print("Model saved at my_fsdp_fp32_model.pt")
 
 # %%
-# %debug
+if debug:
+    model = MambaLM(vocab_size, 
+                    n_layers=12,
+                    n_heads=12,
+                    d_model=768,
+                    d_state=64,
+                    d_conv=4,
+                    expand=2,
+                ).to('cuda')
+    print(num_params(model))
+    model.generate_text("hello there, happy world! test lol lol", 10)
 
-# # %%
-# ds = load_dataset("nampdn-ai/tiny-textbooks", cache_dir="/shared/alex-zhao-storage/hf-cache")
-# L = tokenizer.batch_encode_plus(ds['train']['textbook'][:100], padding=True, truncation=True, max_length=513, padding_side='left')
+# %%
+torch.set_float32_matmul_precision('high')
 
-# # %%
-# L = tokenizer.batch_encode_plus(all_dialogues, padding=True, truncation=True, max_length=33, padding_side='left')
-# dataloader = DataLoader(L['input_ids'], batch_size=8)
-# tokens = tokenizer.batch_encode_plus(all_dialogues, padding=True, truncation=True, max_length=33, padding_side='left')
-# notebook_launcher(training_function, args=(dataloader,), num_processes=8)
+# %%
+# training_function()
 
-# # %%
-# # import torch
-# # import torch.nn as nn
-# # from torch.profiler import profile, record_function, ProfilerActivity
-# # from torch.utils.data import DataLoader
-# # from tqdm import tqdm
-# # import torch.distributed
-# # from accelerate import Accelerator, DistributedDataParallelKwargs
+# %%
+nb_parallelize = False
 
-# # ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+if __name__ == '__main__':
+    # Check if we're running in a notebook or regular Python script
+    if is_in_notebook():
+        if nb_parallelize:
+            notebook_launcher(training_function, num_processes=8)
+        else:
+            notebook_launcher(training_function, num_processes=1)
+    else:
+        training_function()
 
-# # def training_function():
-# #     # Initialize Accelerator (with DDP if used)
-# #     accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
-    
-# #     model = MambaLM(
-# #         tokenizer.vocab_size, 
-# #         n_layers=12,
-# #         n_heads=12,
-# #         d_model=768,
-# #         d_state=128,
-# #         d_conv=4,
-# #         expand=2,
-# #     )
-
-# #     optimizer = torch.optim.AdamW(model.parameters(), lr=0.0001)
-# #     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100)
-
-# #     # Tokenize and create DataLoader
-# #     L = tokenizer.batch_encode_plus(all_dialogues, padding=True, truncation=True, max_length=50, padding_side='left')
-# #     ds = DataLoader(L['input_ids'], batch_size=12)
-
-# #     num_batches = len(ds)
-# #     model, ds, optimizer, scheduler = accelerator.prepare(model, ds, optimizer, scheduler)
-    
-# #     epochs = 1
-# #     ce = nn.CrossEntropyLoss()
-
-# #     progress_bar = None
-# #     if accelerator.is_main_process:
-# #         progress_bar = tqdm(total=epochs * num_batches, desc="Training Progress")
-    
-# #     # ------------------------------
-# #     # START PROFILER CONTEXT
-# #     # ------------------------------
-# #     with profile(
-# #         activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-# #         record_shapes=True,      # (optional) get input shapes
-# #         with_stack=True,         # (optional) gather stack traces
-# #         profile_memory=True      # (optional) track tensor memory usage
-# #     ) as prof:
-
-# #         for epoch in range(epochs):
-# #             for index, batch in enumerate(ds):
-# #                 # Limit to 5 batches for a quick profiling run
-# #                 if index >= 1:
-# #                     break
-
-# #                 x = torch.stack(batch, dim=-1)
-                
-# #                 optimizer.zero_grad()
-# #                 with record_function("forward_pass"):
-# #                     out = model(x[:, :-1])  # model forward
-
-# #                 with record_function("loss_calc"):
-# #                     loss = ce(out.transpose(1,2), x[:, 1:])
-                
-# #                 with record_function("backward"):
-# #                     accelerator.backward(loss)
-                
-# #                 with record_function("optimizer_step"):
-# #                     optimizer.step()
-# #                     scheduler.step()
-
-# #                 if accelerator.is_main_process:
-# #                     progress_bar.update(1)
-
-# #                 # Only call all_reduce if we're actually in a distributed context
-# #                 if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
-# #                     processed_batches = torch.tensor(1, device=accelerator.device)
-# #                     torch.distributed.all_reduce(processed_batches, op=torch.distributed.ReduceOp.SUM)
-
-# #                 print(f"Loss: {loss.item():0.4f}")
-# #                 print(f"Batch {index} complete")
-# #                 batch_sum = torch.sum(x.flatten()) % (10**7 + 9)
-# #                 print(f"Batch sum mod 10^7+9: {batch_sum.item()}")
-
-# #     # ------------------------------
-# #     # END PROFILER CONTEXT
-# #     # ------------------------------
-
-# #     if accelerator.is_main_process:
-# #         progress_bar.close()
-
-# #     # Print a summary of the top CPU-consuming ops
-# #     print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=30))
-
-# #     # Save final model
-# #     unwrapped_model = accelerator.unwrap_model(model)
-# #     torch.save(unwrapped_model.state_dict(), "my_fsdp_fp32_model.pt")
-# #     print("Model saved at my_fsdp_fp32_model.pt")
-
-# # %%
-# from accelerate import notebook_launcher
-# notebook_launcher(training_function, num_processes=8)
-
-# # %%
-# print("Model params", num_params(model))
-# print("Layer params", num_params(model.layers[0]))
-# print("Head params", num_params(model.layers[0].Heads[0]))
-# print("SSM params", num_params(model.layers[0].Heads[0].ssm))
-# print("Conv params", num_params(model.layers[0].Heads[0].conv))
-# print("Up params", num_params(model.layers[0].Heads[0].upscale))
-# print("Gate params", num_params(model.layers[0].Heads[0].gate))
-# print("Down params", num_params(model.layers[0].Heads[0].downscale))
-# print("RMS params", num_params(model.layers[0].rms_norm))
-# print("Out params", num_params(model.layers[0].out_project))
-# print("Layer norm params", num_params(model.layers[0].layer_norm))
-
-# # %%
-# torch.cuda.memory._record_memory_history(max_entries=100000)
-# tokens = tokenizer.encode("hello there, happy world!")
-# tokens = torch.tensor(tokens).unsqueeze(0).to('cuda')
-# tokens = torch.cat([torch.zeros(1, 5, device='cuda', dtype=tokens.dtype), tokens], dim=1)
-# generation = model.forward(tokens)
-# print(tokenizer.decode(generation[0].argmax(dim=-1).tolist()))
-
-# torch.cuda.memory._dump_snapshot("snapshot.pickle")
-# torch.cuda.memory._record_memory_history(enabled=None)
+# %%
+print("Model params", num_params(model))
+print("Layer params", num_params(model.layers[0]))
+print("Head params", num_params(model.layers[0].Heads[0]))
+print("SSM params", num_params(model.layers[0].Heads[0].ssm))
+print("Conv params", num_params(model.layers[0].Heads[0].conv))
+print("Up params", num_params(model.layers[0].Heads[0].upscale))
+print("Gate params", num_params(model.layers[0].Heads[0].gate))
+print("Down params", num_params(model.layers[0].Heads[0].downscale))
+print("RMS params", num_params(model.layers[0].rms_norm))
+print("Out params", num_params(model.layers[0].out_project))
+print("Layer norm params", num_params(model.layers[0].layer_norm))
 
 

@@ -501,6 +501,13 @@ class MambaLM(nn.Module):
                 batch_progress.set_description(f"Loss: {epoch_loss / (index + 1):0.4f}")
                 if enable_wandb:
                     wandb.log({"loss": loss.item()})
+                if accelerator is not None:
+                    # Gather and average loss across all GPUs
+                    gathered_loss = accelerator.gather(torch.tensor([loss.item()]).to(loss.device))
+                    avg_loss = gathered_loss.mean().item()
+                    if is_main_process:
+                        if enable_wandb:
+                            wandb.log({"avg_loss": avg_loss})
 
                 # if index % 100 == 0 and is_main_process:
                 #     print(f"Test generation `the weather today is` at {index / len(ds) * 100:.2f}% completion: ", MambaLM.generate_text(model, "the weather today is", 10))
@@ -577,6 +584,8 @@ def print_time():
 
 vocab_size = tokenizer.vocab_size
 
+glob_wandb_on = True
+
 def training_function():
     accelerator = Accelerator()
     special_print("Accelerator initialized", accelerator)
@@ -627,7 +636,7 @@ def training_function():
         wandb.watch(model)
 
     epochs = 1
-    MambaLM.train(model, dataloader, optimizer, scheduler, epochs, accelerator, enable_wandb=is_main_process)
+    MambaLM.train(model, dataloader, optimizer, scheduler, epochs, accelerator, enable_wandb=is_main_process and glob_wandb_on)
     
     # 6. Save final model
     # Must unwrap to gather full weights from all shards

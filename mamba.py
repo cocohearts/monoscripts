@@ -623,9 +623,10 @@ def training_function():
     special_print(f"Model params: {num_params(model)}", accelerator)
     special_print(f"Token:params ratio: {num_tokens / num_params(model)}", accelerator)
 
-    optimizer = torch.optim.AdamW(model.parameters(), betas=(0.9, 0.95), weight_decay=0.1, lr=0.001)
+    optimizer = torch.optim.AdamW(model.parameters(), betas=(0.9, 0.95), weight_decay=0.1, lr=0.0006)
     # optimizer = torch.optim.SGD(model.parameters(), lr=0.001)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100)
+    epochs = 1
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=len(dataloader) / 8 * epochs)
 
     model, dataloader, optimizer, scheduler = accelerator.prepare(model, dataloader, optimizer, scheduler)
     special_print("Prepared with Accelerator", accelerator)
@@ -635,7 +636,6 @@ def training_function():
     if is_main_process:
         wandb.watch(model)
 
-    epochs = 1
     MambaLM.train(model, dataloader, optimizer, scheduler, epochs, accelerator, enable_wandb=is_main_process and glob_wandb_on)
     
     # 6. Save final model

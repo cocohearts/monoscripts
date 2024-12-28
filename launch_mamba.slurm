@@ -4,6 +4,7 @@
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:8             # Request 8 GPUs
 #SBATCH --time=60:00:00          # Set a 60-hour time limit
+#SBATCH --cpus-per-task=80
 #SBATCH --partition=main  # Replace with the appropriate partition name
 #SBATCH --output=accelerate_launch_%j.out
 #SBATCH --error=accelerate_launch_%j.err

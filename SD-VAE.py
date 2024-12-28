@@ -325,18 +325,21 @@ class SANA_VAE(nn.Module):
         optimizer.step()
         scheduler.step()
 
+        gathered_loss = accelerator.gather(loss)
+        gathered_viz_loss = accelerator.gather(viz_loss)
+        gathered_kl_loss = accelerator.gather(kl_loss)
+        gathered_l2_loss = accelerator.gather(l2_loss)
+
         if enable_wandb and is_main_process:
-            wandb.log({"loss": loss.item()})
-            print(f"Loss: {loss.item()}")
-            gathered_loss = accelerator.gather(loss)
-            avg_loss = gathered_loss.mean().item()
-            wandb.log({"avg_loss": avg_loss})
-            print(f"Avg loss: {avg_loss}")
-            wandb.log({"viz_loss": viz_loss.item()})
-            wandb.log({"kl_loss": kl_loss.item()})
-            wandb.log({"l2_loss": l2_loss.item()})
-            if teach_gan:
-                wandb.log({"gan_loss": gan_loss.item()})
+            wandb.log({"loss": gathered_loss.mean().item()})
+            wandb.log({"viz_loss": gathered_viz_loss.mean().item()})
+            wandb.log({"kl_loss": gathered_kl_loss.mean().item()})
+            wandb.log({"l2_loss": gathered_l2_loss.mean().item()})
+
+        if teach_gan:
+            gathered_gan_loss = accelerator.gather(gan_loss)
+            if is_main_process:
+                wandb.log({"gan_loss": gathered_gan_loss.mean().item()})
 
         return loss.item()
 
@@ -388,13 +391,15 @@ class SANA_VAE(nn.Module):
             return
 
         # Load and transform a single image for visualization
-        img_path = f"/shared/imagenet/train/image_0_recon_{index}.jpg"
+        img_path = f"/shared/imagenet/train/image_0.jpg"
         img = Image.open(img_path)
         transform = transforms.Compose([
-            transforms.Resize((224, 224)),
-            transforms.ToTensor()
+            transforms.Resize((256, 256)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], 
+                                std=[0.229, 0.224, 0.225])
         ])
-        img_tensor = transform(img).unsqueeze(0).to(self.device)
+        img_tensor = transform(img).unsqueeze(0).to(next(self.parameters()).device)
 
         # Pass through model
         with torch.no_grad():
@@ -402,8 +407,10 @@ class SANA_VAE(nn.Module):
             
         # Convert output tensor to PIL image
         recon_img = transforms.ToPILImage()(recon.squeeze().cpu())
-        recon_img.save("reconstructed_image_0.jpg")
+        recon_img.save(f"test_imgs/reconstructed_image_0_{index}.jpg")
         # Save reconstructed image to wandb if enabled
+        if is_main_process:
+            print(f"Eval'd reconstructed image to `test_imgs/reconstructed_image_0_{index}.jpg`")
         if enable_wandb and is_main_process:
             wandb.log({
                 "original_image": wandb.Image(img),

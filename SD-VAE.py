@@ -367,6 +367,8 @@ class SANA_VAE(nn.Module):
                 loss = self.train_step(batch, optimizer, disc_optimizer, scheduler, disc_scheduler, clip_model, resize, accelerator, enable_wandb, teach_gan=enable_gan, enable_gan=now_enable_gan)
                 epoch_loss += loss
                 batch_progress.update(1)
+                if index % 20 == 0:
+                    self.visual_eval(accelerator, index, enable_wandb)
                 
             epoch_loss /= len(dataloader)
             progress_bar.set_postfix({'loss': f'{epoch_loss:.4f}'})
@@ -378,6 +380,35 @@ class SANA_VAE(nn.Module):
         
         if is_main_process:
             print(f"Best loss: {best_loss}")
+    
+    def visual_eval(self, accelerator=None, index=0, enable_wandb=False):
+        is_main_process = accelerator is not None and accelerator.is_main_process
+        is_main_process = accelerator is None or is_main_process
+        if not is_main_process:
+            return
+
+        # Load and transform a single image for visualization
+        img_path = f"/shared/imagenet/train/image_0_recon_{index}.jpg"
+        img = Image.open(img_path)
+        transform = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor()
+        ])
+        img_tensor = transform(img).unsqueeze(0).to(self.device)
+
+        # Pass through model
+        with torch.no_grad():
+            recon = self(img_tensor)
+            
+        # Convert output tensor to PIL image
+        recon_img = transforms.ToPILImage()(recon.squeeze().cpu())
+        recon_img.save("reconstructed_image_0.jpg")
+        # Save reconstructed image to wandb if enabled
+        if enable_wandb and is_main_process:
+            wandb.log({
+                "original_image": wandb.Image(img),
+                "reconstructed_image": wandb.Image(recon_img)
+            })
 
 # %%
 def num_params(model):
@@ -412,10 +443,12 @@ def training_function():
     # Make accelerator global so it's accessible in the train method
     start_time = time.time()
     accelerator = Accelerator()
+    special_print("Accelerator initialized", accelerator, start_time)
     is_main_process = accelerator.is_main_process
     if is_main_process and glob_wandb_on:
         wandb.login(key=os.getenv("WANDB_API_KEY"))
         wandb.init(project="monoscripts-vae")
+        special_print("Wandb initialized", accelerator, start_time)
 
     dataloader = get_dataloader(batch_size=256)
     special_print("Loaded dataloader", accelerator, start_time)

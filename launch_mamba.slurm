@@ -6,8 +6,8 @@
 #SBATCH --time=60:00:00          # Set a 60-hour time limit
 #SBATCH --cpus-per-task=80
 #SBATCH --partition=main  # Replace with the appropriate partition name
-#SBATCH --output=accelerate_launch_%j.out
-#SBATCH --error=accelerate_launch_%j.err
+#SBATCH --output=slurm_logs/mamba_%j.out
+#SBATCH --error=slurm_logs/mamba_%j.err
 
 # Load necessary modules
 # module load python

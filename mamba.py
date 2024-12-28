@@ -463,16 +463,18 @@ class MambaLM(nn.Module):
         else:
             loss.backward()
         
+        num_nan = 0
         # Check for nan gradients and zero them out
         for param in model.parameters():
             if param.grad is not None and (torch.isnan(param.grad).any() or torch.isinf(param.grad).any()):
                 param.grad.zero_()
+                num_nan += param.numel()
                 # print(f"Gradient for {param.name} with {param.numel()} elements is {'nan' if torch.isnan(param.grad).any() else 'inf'}. Zeroing out.")
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # clip the gradients
         optimizer.step()
         scheduler.step()
-        return loss
+        return loss, num_nan
     
     @staticmethod
     def train(model, ds, optimizer, scheduler, epochs=1, accelerator=None, enable_wandb=False):
@@ -495,12 +497,12 @@ class MambaLM(nn.Module):
 
             for index, batch in enumerate(batch_progress):
                 # if accelerator is not None and accelerator.is_main_process:
-                loss = MambaLM.train_step(model, batch.to(next(model.parameters()).device), optimizer, scheduler, accelerator)
+                loss, num_nan = MambaLM.train_step(model, batch.to(next(model.parameters()).device), optimizer, scheduler, accelerator)
                 epoch_loss += loss.item()
                 batch_progress.update(1)
                 batch_progress.set_description(f"Loss: {epoch_loss / (index + 1):0.4f}")
                 if enable_wandb:
-                    wandb.log({"loss": loss.item()})
+                    wandb.log({"loss": loss.item(), "num_nan_grad": num_nan})
                 if accelerator is not None:
                     # Gather and average loss across all GPUs
                     gathered_loss = accelerator.gather(torch.tensor([loss.item()]).to(loss.device))
@@ -508,6 +510,10 @@ class MambaLM(nn.Module):
                     if is_main_process:
                         if enable_wandb:
                             wandb.log({"avg_loss": avg_loss})
+                    if enable_wandb:
+                        gathered_num_nan = accelerator.gather(torch.tensor([num_nan]).to(num_nan.device))
+                        total_num_nan = gathered_num_nan.sum().item()
+                        wandb.log({"total_num_nan_grad": total_num_nan})
 
                 # if index % 100 == 0 and is_main_process:
                 #     print(f"Test generation `the weather today is` at {index / len(ds) * 100:.2f}% completion: ", MambaLM.generate_text(model, "the weather today is", 10))
@@ -623,7 +629,7 @@ def training_function():
     special_print(f"Model params: {num_params(model)}", accelerator)
     special_print(f"Token:params ratio: {num_tokens / num_params(model)}", accelerator)
 
-    optimizer = torch.optim.AdamW(model.parameters(), betas=(0.9, 0.95), weight_decay=0.1, lr=0.0006)
+    optimizer = torch.optim.AdamW(model.parameters(), betas=(0.9, 0.95), weight_decay=0.1, lr=0.00002)
     # optimizer = torch.optim.SGD(model.parameters(), lr=0.001)
     epochs = 1
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=len(dataloader) / 8 * epochs)
@@ -641,8 +647,8 @@ def training_function():
     # 6. Save final model
     # Must unwrap to gather full weights from all shards
     unwrapped_model = accelerator.unwrap_model(model)
-    torch.save(unwrapped_model.state_dict(), "my_fsdp_fp32_model.pt")
-    print("Model saved at my_fsdp_fp32_model.pt")
+    torch.save(unwrapped_model.state_dict(), "mamba_lm.pt")
+    print("Model saved at mamba_lm.pt")
 
 # %%
 if debug:

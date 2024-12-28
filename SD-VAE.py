@@ -1,4 +1,6 @@
 # %%
+import wandb
+import time
 from PIL import Image
 import numpy as np
 from tqdm import tqdm, trange
@@ -12,6 +14,10 @@ from torchvision import transforms
 from accelerate import Accelerator, notebook_launcher
 import clip
 import ipywidgets as widgets
+import dotenv
+import os
+
+dotenv.load_dotenv()
 
 # %%
 # if __name__ == "__main__":
@@ -128,6 +134,7 @@ class ResConvBlock(nn.Module):
                 layer_norms.append(nn.LayerNorm((out_channels, output_width, output_width)))
         self.conv_layers = nn.ModuleList(conv_layers)
         self.layer_norms = nn.ModuleList(layer_norms)
+        self.final_layer_norm = nn.LayerNorm((out_channels, output_width, output_width))
     
     def forward(self, x):
         assert(self.out_channels // self.in_channels in [2, 4])
@@ -139,8 +146,8 @@ class ResConvBlock(nn.Module):
             if index < len(self.conv_layers) - 1:
                 x = x + layer_norm(y)
             else:
-                x = space_2_channel_x + y
-        return x
+                x = space_2_channel_x + layer_norm(y)
+        return self.final_layer_norm(x)
 
 class ResConvTransposeBlock(nn.Module):
     def __init__(self, in_channels, out_channels, output_width, kernel_size, stride, padding, activation=nn.LeakyReLU(0.2), depth=1):
@@ -164,6 +171,7 @@ class ResConvTransposeBlock(nn.Module):
                 layer_norms.append(nn.LayerNorm((out_channels, output_width, output_width)))
         self.conv_layers = nn.ModuleList(conv_layers)
         self.layer_norms = nn.ModuleList(layer_norms)
+        self.final_layer_norm = nn.LayerNorm((out_channels, output_width, output_width))
     
     def forward(self, x):
         assert(self.in_channels // self.out_channels in [2, 4])
@@ -174,8 +182,8 @@ class ResConvTransposeBlock(nn.Module):
             if index < len(self.conv_layers) - 1:
                 x = x + layer_norm(y)
             else:
-                x = channel_2_space_x + y
-        return x
+                x = channel_2_space_x + layer_norm(y)
+        return self.final_layer_norm(x)
 
 # %%
 class SANA_Encoder(nn.Module):
@@ -217,7 +225,7 @@ class SANA_Discriminator(nn.Module):
         self.kernel_sizes = [11, 9, 5, 3, 3]
         self.strides = [2, 2, 2, 2, 2]
         self.paddings = [k//2 for k in self.kernel_sizes]
-        self.lin_dims = [96 * 16 * 16, 96 * 8, 32 * 8, 128, 64, 32, 16, 1]
+        self.lin_dims = [96 * 8 * 8, 96 * 8, 32 * 8, 128, 64, 32, 16, 1]
         self.activation = nn.LeakyReLU(0.2)
         self.convlayers = nn.ModuleList([
             nn.Conv2d(self.channels[index], self.channels[index+1], kernel_size, stride, padding)
@@ -232,9 +240,10 @@ class SANA_Discriminator(nn.Module):
             x = conv_layer(x)
             x = self.activation(x)
         x = x.view(x.shape[0], -1)
-        for lin_layer in self.lin_layers:
+        for index, lin_layer in enumerate(self.lin_layers):
             x = lin_layer(x)
-            x = self.activation(x)
+            if index < len(self.lin_layers) - 1:
+                x = self.activation(x)
         return x
 
 # %%
@@ -274,13 +283,13 @@ class SANA_VAE(nn.Module):
         return self.decode(self.encode(x, eps))
     
     def KL_loss(self, mu1, logvar1, mu2, logvar2):
-        det_diff = torch.sum(logvar1 - logvar2)
-        ratio = torch.exp(logvar1 - logvar2).sum()
-        mean_diff = ((mu1 - mu2).pow(2) / torch.exp(logvar2)).sum()
+        det_diff = torch.mean(logvar1 - logvar2)
+        ratio = torch.mean(torch.exp(logvar1 - logvar2))
+        mean_diff = torch.mean(((mu1 - mu2).pow(2) / torch.exp(logvar2)))
         return 0.5 * (det_diff + ratio + mean_diff)
     
-    def train_step(self, batch, optimizer, clip_model, resize):
-        optimizer.zero_grad()
+    def train_step(self, batch, optimizer, disc_optimizer, scheduler, disc_scheduler, clip_model, resize, accelerator=None, enable_wandb=False, teach_gan=False, enable_gan=False):
+        is_main_process = accelerator is not None and accelerator.is_main_process
         encoded_info = self.get_encoder_output(batch)
         mu, logvar = self.split_code(encoded_info)
         eps = torch.randn_like(mu)
@@ -288,20 +297,53 @@ class SANA_VAE(nn.Module):
         output = self.decode(encoded)
 
         kl_loss = self.KL_loss(mu, logvar, torch.zeros_like(mu), torch.ones_like(mu))
+        print(f"KL loss: {kl_loss}")
         viz_loss = CLIP_loss(batch, output, clip_model, resize)
+        print(f"Viz loss: {viz_loss}")
         mse = nn.MSELoss()
         l2_loss = mse(batch, output)
-        gan_loss = 0
+        print(f"L2 loss: {l2_loss}")
+        loss = viz_loss + kl_loss + l2_loss
+        if teach_gan:
+            gan_fake_loss = -torch.sigmoid(self.discriminator(output)).log().mean()
+            gan_real_loss = -(1-torch.sigmoid(self.discriminator(batch))).log().mean()
+            gan_loss = gan_fake_loss + gan_real_loss
+            print(f"GAN loss: {gan_loss}")
+            disc_optimizer.zero_grad()
+            gan_loss.backward(retain_graph=True)
+            disc_optimizer.step()
+            disc_scheduler.step()
+        
+        if enable_gan and teach_gan:
+            loss -= gan_loss
 
-        loss = viz_loss + kl_loss + l2_loss + gan_loss
-        loss.backward()
+        if accelerator is not None:
+            accelerator.backward(loss)
+        else:
+            loss.backward()
+        optimizer.zero_grad()
         optimizer.step()
+        scheduler.step()
+
+        if enable_wandb and is_main_process:
+            wandb.log({"loss": loss.item()})
+            print(f"Loss: {loss.item()}")
+            gathered_loss = accelerator.gather(loss)
+            avg_loss = gathered_loss.mean().item()
+            wandb.log({"avg_loss": avg_loss})
+            print(f"Avg loss: {avg_loss}")
+            wandb.log({"viz_loss": viz_loss.item()})
+            wandb.log({"kl_loss": kl_loss.item()})
+            wandb.log({"l2_loss": l2_loss.item()})
+            if teach_gan:
+                wandb.log({"gan_loss": gan_loss.item()})
+
         return loss.item()
 
-    def train(self, dataloader, optimizer, clip_model, resize, epochs=100, accelerator=None):
+    def train(self, dataloader, optimizer, disc_optimizer, scheduler, disc_scheduler, clip_model, resize, epochs=100, accelerator=None, enable_wandb=False, enable_gan=False):
         best_loss = float('inf')
         # Get process info from accelerator
-        is_main_process = accelerator.is_main_process
+        is_main_process = accelerator is not None and accelerator.is_main_process
         progress_bar = tqdm(range(epochs), 
                            desc=f"Training (process {accelerator.process_index})", 
                            position=accelerator.process_index*2,
@@ -317,9 +359,12 @@ class SANA_VAE(nn.Module):
             epoch_loss = 0
             batch_progress.reset()
             
-            for batch in dataloader:
+            for index, batch in enumerate(dataloader):
                 batch = batch.to(next(self.parameters()).device)
-                loss = SANA_VAE.train_step(self, batch, optimizer, clip_model, resize)
+
+                enable_gan_cutoff = 0.9
+                now_enable_gan = enable_gan and (index / len(dataloader) > enable_gan_cutoff)
+                loss = self.train_step(batch, optimizer, disc_optimizer, scheduler, disc_scheduler, clip_model, resize, accelerator, enable_wandb, teach_gan=enable_gan, enable_gan=now_enable_gan)
                 epoch_loss += loss
                 batch_progress.update(1)
                 
@@ -352,24 +397,44 @@ def num_params(model):
 # optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 # SANA_VAE.train(model, dataloader, optimizer, clip_model, resize, epochs=10)
 
+glob_wandb_on = True
+enable_gan = True
+
+def special_print(my_str, accelerator, start_time):
+    if accelerator.is_main_process:
+        print(my_str)
+        elapsed = time.time() - start_time
+        minutes = int(elapsed // 60)
+        seconds = int(elapsed % 60)
+        print(f"Elapsed time: {minutes:02d}:{seconds:02d}")
 # %%
 def training_function():
     # Make accelerator global so it's accessible in the train method
-    global accelerator
+    start_time = time.time()
     accelerator = Accelerator()
+    is_main_process = accelerator.is_main_process
+    if is_main_process and glob_wandb_on:
+        wandb.login(key=os.getenv("WANDB_API_KEY"))
+        wandb.init(project="monoscripts-vae")
 
     dataloader = get_dataloader(batch_size=256)
+    special_print("Loaded dataloader", accelerator, start_time)
 
     clip_model, resize = get_clip_model(device=accelerator.device)
 
     model = SANA_VAE()
-    print(f"Number of parameters: {num_params(model)}")
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    special_print(f"Number of parameters: {num_params(model)}", accelerator, start_time)
+    optimizer = torch.optim.Adam(list(model.encoder.parameters()) + list(model.decoder.parameters()), lr=6e-4, betas=(0.9, 0.99))
+    disc_optimizer = torch.optim.Adam(model.discriminator.parameters(), lr=6e-4, betas=(0.9, 0.99))
 
-    model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
+    scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1.0, end_factor=0.0, total_iters=len(dataloader) // 8)
+    disc_scheduler = torch.optim.lr_scheduler.LinearLR(disc_optimizer, start_factor=1.0, end_factor=0.0, total_iters=len(dataloader) // 8)
+
+    model, optimizer, disc_optimizer, scheduler, disc_scheduler, dataloader = accelerator.prepare(model, optimizer, disc_optimizer, scheduler, disc_scheduler, dataloader)
     model = torch.compile(model)
+    special_print("Prepared and compiled model", accelerator, start_time)
 
-    SANA_VAE.train(model.module, dataloader, optimizer, clip_model, resize, epochs=3, accelerator=accelerator)
+    SANA_VAE.train(model.module if hasattr(model, 'module') else model, dataloader, optimizer, disc_optimizer, scheduler, disc_scheduler, clip_model, resize, epochs=1, accelerator=accelerator, enable_wandb=glob_wandb_on, enable_gan=enable_gan)
 
 # %%
 os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3,4,5,6,7'

@@ -63,11 +63,16 @@ def get_dataloader(batch_size=256):
     ])
     dataset = ImageNetDataset(root_dir='/shared/imagenet/train', 
                             transform=transform)
+    sampler = torch.utils.data.SequentialSampler(dataset)
     dataloader = DataLoader(dataset, 
                         batch_size=batch_size,
-                        shuffle=True,
-                        num_workers=0)
-    return dataloader
+                        shuffle=False,
+                        num_workers=8,
+                        pin_memory=True,
+                        prefetch_factor=2,
+                        persistent_workers=True,
+                        sampler=sampler)
+    return dataloader, sampler
 
 # %%
 def get_clip_model(device='cpu'):
@@ -288,7 +293,7 @@ class SANA_VAE(nn.Module):
         mean_diff = torch.mean(((mu1 - mu2).pow(2) / torch.exp(logvar2)))
         return 0.5 * (det_diff + ratio + mean_diff)
     
-    def train_step(self, batch, optimizer, disc_optimizer, scheduler, clip_model, resize, accelerator=None, enable_wandb=False, teach_gan=False, enable_gan=False, gan_coeff=0.0, beta_viz=1.0, beta_kl=0.001, beta_l2=1.0):
+    def train_step(self, batch, optimizer, disc_optimizer, scheduler, clip_model, resize, accelerator=None, enable_wandb=False, teach_gan=False, enable_gan=False, gan_coeff=0.0, beta_viz=1.0, beta_kl=0.001, beta_l2=1.0, beta_gan=1.0):
         is_main_process = accelerator is not None and accelerator.is_main_process
         encoded_info = self.get_encoder_output(batch)
         mu, logvar = self.split_code(encoded_info)
@@ -314,7 +319,7 @@ class SANA_VAE(nn.Module):
             gan_loss.backward(retain_graph=True)
         
         if enable_gan and teach_gan:
-            loss -= gan_coeff * gan_loss
+            loss -= beta_gan * gan_coeff * gan_loss
 
         optimizer.zero_grad()
         if accelerator is not None:
@@ -332,12 +337,16 @@ class SANA_VAE(nn.Module):
         gathered_viz_loss = accelerator.gather(viz_loss)
         gathered_kl_loss = accelerator.gather(kl_loss)
         gathered_l2_loss = accelerator.gather(l2_loss)
+        gathered_mu_norm = accelerator.gather(mu).pow(2).mean()
+        gathered_logvar = accelerator.gather(logvar).mean()
 
         if enable_wandb and is_main_process:
             wandb.log({"loss": gathered_loss.mean().item()})
             wandb.log({"viz_loss": gathered_viz_loss.mean().item()})
             wandb.log({"kl_loss": gathered_kl_loss.mean().item()})
             wandb.log({"l2_loss": gathered_l2_loss.mean().item()})
+            wandb.log({"mu_squared": gathered_mu_norm.item()})
+            wandb.log({"logvar": gathered_logvar.item()})
 
         if teach_gan:
             gathered_gan_loss = accelerator.gather(gan_loss)
@@ -346,7 +355,7 @@ class SANA_VAE(nn.Module):
 
         return loss.item()
 
-    def train(self, dataloader, optimizer, disc_optimizer, scheduler, clip_model, resize, epochs=100, accelerator=None, enable_wandb=False, enable_gan=False, enable_gan_cutoff=0.8, beta_viz=1.0, beta_kl=0.001, beta_l2=1.0):
+    def train(self, dataloader, optimizer, disc_optimizer, scheduler, clip_model, resize, epochs=100, accelerator=None, enable_wandb=False, enable_gan=False, enable_gan_cutoff=0.8, beta_viz=1.0, beta_kl=0.001, beta_l2=1.0, beta_gan=1.0):
         best_loss = float('inf')
         # Get process info from accelerator
         is_main_process = accelerator is not None and accelerator.is_main_process
@@ -363,7 +372,7 @@ class SANA_VAE(nn.Module):
         
         num_steps = len(dataloader) * epochs
         gan_coeffs = iter(np.linspace(0, 1, num_steps) ** 2)
-        for _ in progress_bar:
+        for index, _ in enumerate(progress_bar):
             epoch_loss = 0
             batch_progress.reset()
             
@@ -371,7 +380,7 @@ class SANA_VAE(nn.Module):
                 batch = batch.to(next(self.parameters()).device)
 
                 now_enable_gan = enable_gan and (index / len(dataloader) > enable_gan_cutoff)
-                loss = self.train_step(batch, optimizer, disc_optimizer, scheduler, clip_model, resize, accelerator, enable_wandb, teach_gan=enable_gan, enable_gan=True, gan_coeff=next(gan_coeffs), beta_viz=beta_viz, beta_kl=beta_kl, beta_l2=beta_l2)
+                loss = self.train_step(batch, optimizer, disc_optimizer, scheduler, clip_model, resize, accelerator, enable_wandb, teach_gan=enable_gan, enable_gan=True, gan_coeff=next(gan_coeffs), beta_viz=beta_viz, beta_kl=beta_kl, beta_l2=beta_l2, beta_gan=beta_gan)
                 epoch_loss += loss
                 batch_progress.update(1)
                 if index % 20 == 0:
@@ -383,7 +392,7 @@ class SANA_VAE(nn.Module):
             if epoch_loss < best_loss:
                 best_loss = epoch_loss
                 if is_main_process:
-                    torch.save(self.state_dict(), "long_sana_vae.pt")
+                    torch.save(self.state_dict(), "x_long_sana_vae.pt")
         
         # if is_main_process:
             # print(f"Best loss: {best_loss}")
@@ -456,21 +465,22 @@ def training_function():
     accelerator = Accelerator()
     special_print("Accelerator initialized", accelerator, start_time)
     beta_viz = 1.0
-    beta_kl = 0.0010
-    beta_l2 = 1.0
+    beta_kl = 0.1
+    beta_l2 = 4.0
+    beta_gan = 1.0
     enable_gan_cutoff = 0.7
     enable_gan = True
     lr = 1e-3
     disc_lr = 1e-4
-    epochs = 24
+    epochs = 128
 
     is_main_process = accelerator.is_main_process
     if is_main_process and glob_wandb_on:
         wandb.login(key=os.getenv("WANDB_API_KEY"))
-        wandb.init(project="monoscripts-vae", config={"lr": lr, "beta_viz": beta_viz, "beta_kl": beta_kl, "beta_l2": beta_l2, "disc_lr": disc_lr, "enable_gan_cutoff": enable_gan_cutoff, "epochs": epochs, "enable_gan": enable_gan, "super_compile": True})
+        wandb.init(project="monoscripts-vae", config={"lr": lr, "beta_viz": beta_viz, "beta_kl": beta_kl, "beta_l2": beta_l2, "disc_lr": disc_lr, "enable_gan_cutoff": enable_gan_cutoff, "epochs": epochs, "enable_gan": enable_gan, "beta_gan": beta_gan, "super_compress": True})
         special_print("Wandb initialized", accelerator, start_time)
 
-    dataloader = get_dataloader(batch_size=256)
+    dataloader, _ = get_dataloader(batch_size=256)
     special_print("Loaded dataloader", accelerator, start_time)
 
     clip_model, resize = get_clip_model(device=accelerator.device)
@@ -493,7 +503,7 @@ def training_function():
         if glob_wandb_on:
             wandb.watch(model)
 
-    SANA_VAE.train(model.module if hasattr(model, 'module') else model, dataloader, optimizer, disc_optimizer, scheduler, clip_model, resize, epochs=epochs, accelerator=accelerator, enable_wandb=glob_wandb_on, enable_gan=enable_gan, enable_gan_cutoff=enable_gan_cutoff, beta_viz=beta_viz, beta_kl=beta_kl, beta_l2=beta_l2)
+    SANA_VAE.train(model.module if hasattr(model, 'module') else model, dataloader, optimizer, disc_optimizer, scheduler, clip_model, resize, epochs=epochs, accelerator=accelerator, enable_wandb=glob_wandb_on, enable_gan=enable_gan, enable_gan_cutoff=enable_gan_cutoff, beta_viz=beta_viz, beta_kl=beta_kl, beta_l2=beta_l2, beta_gan=beta_gan)
 
 # %%
 os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3,4,5,6,7'

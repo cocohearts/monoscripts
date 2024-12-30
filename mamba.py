@@ -1,4 +1,4 @@
-# %%
+import time
 import wandb
 import torch
 import torch.nn as nn
@@ -37,7 +37,8 @@ dotenv.load_dotenv()
 # ds = load_dataset("bigcode/the-stack-v2", cache_dir="/shared/alex-zhao-storage/the-stack-v2", split="train")
 # tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-11b-Vision", cache_dir="/shared/alex-zhao-storage/hf-cache")
 tokenizer = AutoTokenizer.from_pretrained("gpt2", cache_dir="/shared/alex-zhao-storage/hf-cache")
-tokenizer.pad_token_id = tokenizer.eos_token_id
+if tokenizer.pad_token_id is None:
+    tokenizer.pad_token = tokenizer.eos_token
 # tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased", cache_dir="/shared/alex-zhao-storage/hf-cache")
 # tokenizer.vocab_size
 # torch._logging.set_log_level("ERROR")
@@ -79,14 +80,14 @@ class TextDataset(Dataset):
         return len(self.text)
     
     def __getitem__(self, idx):
-        output = self.tokenizer.encode(self.text[idx], return_tensors="pt", padding=True, truncation=True, padding_side="left", max_length=512)
+        output = self.tokenizer.encode(self.text[idx], return_tensors="pt", padding=True, truncation=True, padding_side="right", max_length=512)
         # Squeeze to remove batch dimension added by tokenizer
         output = output.squeeze(0)
 
         # Pad to length 513 from the left if needed
         padding_length = 512 - output.size(0)
         padding = torch.full((padding_length,), self.tokenizer.pad_token_id)
-        output = torch.cat([padding, output], dim=0)
+        output = torch.cat([output, padding], dim=0)
             
         return output
     
@@ -411,7 +412,7 @@ class FFN(nn.Module):
 
 # %%
 class MambaLM(nn.Module):
-    def __init__(self, vocab_size, n_layers, n_heads, d_model, d_state, d_conv, expand, context_len=1000):
+    def __init__(self, vocab_size, n_layers, n_heads, d_model, d_state, d_conv, expand, context_len=600):
         super().__init__()
 
         self.vocab_size = vocab_size
@@ -433,18 +434,9 @@ class MambaLM(nn.Module):
         self.layers = nn.ModuleList([MambaLayer(n_heads, d_model, d_state, d_conv, expand) for _ in range(n_layers)])
         self.output_layer = nn.Linear(d_model, self.vocab_size)
 
-    def forward(self, x: torch.Tensor, keep_hidden=False, use_hidden=False, position_shift=0) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Count zeros on left side of each sequence
-        mask = (x == 0).to(next(self.parameters()).device)
-        left_zeros = mask.cummin(dim=1)[0].sum(dim=1, keepdim=True)
-
-        pos_embed_indices = torch.arange(x.shape[1]).expand(x.shape[0], -1).to(next(self.parameters()).device) - left_zeros
-        pos_embed_indices = torch.where(pos_embed_indices >= 0, pos_embed_indices, 0)
-        pos_embed_indices += position_shift
-        pos_embed = torch.where(pos_embed_indices.unsqueeze(-1) >= 0, self.pos_embedding(pos_embed_indices), 0)
-
+    def forward(self, x: torch.Tensor, keep_hidden=False, use_hidden=False) -> Tuple[torch.Tensor, torch.Tensor]:
         x = self.embedding(x)
-        x = x + pos_embed
+        x = x + self.pos_embedding(torch.arange(x.shape[1]).expand(x.shape[0], -1).to(next(self.parameters()).device))
         if x.isnan().any() or x.isinf().any():
             raise ValueError("NaN or Inf values detected in MambaLM input")
         for layer in self.layers:
@@ -462,19 +454,22 @@ class MambaLM(nn.Module):
             accelerator.backward(loss)
         else:
             loss.backward()
+
+        correct = (out.argmax(dim=-1) == x[:, 1:]).sum().item()
+        acc = correct / x[:, 1:].numel()
         
         num_nan = 0
         # Check for nan gradients and zero them out
         for param in model.parameters():
-            if param.grad is not None and (torch.isnan(param.grad).any() or torch.isinf(param.grad).any()):
-                param.grad.zero_()
-                num_nan += param.numel()
-                # print(f"Gradient for {param.name} with {param.numel()} elements is {'nan' if torch.isnan(param.grad).any() else 'inf'}. Zeroing out.")
+            changed = torch.isnan(param.grad).sum().item() + torch.isinf(param.grad).sum().item()
+            num_nan += changed
+            if changed > 0:
+                param.grad[torch.isnan(param.grad) | torch.isinf(param.grad)] = 0
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # clip the gradients
         optimizer.step()
         scheduler.step()
-        return loss, num_nan
+        return loss, torch.tensor([acc]).to(accelerator.device), torch.tensor([num_nan]).to(accelerator.device)
     
     @staticmethod
     def train(model, ds, optimizer, scheduler, epochs=1, accelerator=None, enable_wandb=False):
@@ -497,26 +492,25 @@ class MambaLM(nn.Module):
 
             for index, batch in enumerate(batch_progress):
                 # if accelerator is not None and accelerator.is_main_process:
-                loss, num_nan = MambaLM.train_step(model, batch.to(next(model.parameters()).device), optimizer, scheduler, accelerator)
+                loss, acc, num_nan = MambaLM.train_step(model, batch.to(next(model.parameters()).device), optimizer, scheduler, accelerator)
                 epoch_loss += loss.item()
                 batch_progress.update(1)
                 batch_progress.set_description(f"Loss: {epoch_loss / (index + 1):0.4f}")
                 if enable_wandb:
-                    wandb.log({"loss": loss.item(), "num_nan_grad": num_nan})
-                if accelerator is not None:
-                    # Gather and average loss across all GPUs
-                    gathered_loss = accelerator.gather(torch.tensor([loss.item()]).to(loss.device))
+                    gathered_loss = accelerator.gather(loss)
+                    gathered_acc = accelerator.gather(acc)
                     avg_loss = gathered_loss.mean().item()
-                    if is_main_process:
-                        if enable_wandb:
-                            wandb.log({"avg_loss": avg_loss})
-                    if enable_wandb:
-                        gathered_num_nan = accelerator.gather(torch.tensor([num_nan]).to(num_nan.device))
-                        total_num_nan = gathered_num_nan.sum().item()
-                        wandb.log({"total_num_nan_grad": total_num_nan})
+                    avg_acc = gathered_acc.mean().item()
 
-                # if index % 100 == 0 and is_main_process:
-                #     print(f"Test generation `the weather today is` at {index / len(ds) * 100:.2f}% completion: ", MambaLM.generate_text(model, "the weather today is", 10))
+                    if is_main_process:
+                        wandb.log({"loss": loss.item(), "num_nan_grad": num_nan.item(), "acc": acc.item()})
+                        wandb.log({"avg_loss": avg_loss, "avg_acc": avg_acc})
+
+                if index % 100 == 0 and is_main_process:
+                    generation = MambaLM.generate_text(model.module if hasattr(model, 'module') else model, "the weather today is", 10)
+                    print(f"Test generation `the weather today is` at {index / len(ds) * 100:.2f}% completion: ", generation)
+                    if enable_wandb:
+                        wandb.log({"test_generation": generation})
 
             if epoch_loss < best_loss:
                 best_loss = epoch_loss
@@ -541,9 +535,15 @@ class MambaLM(nn.Module):
         return returned
 
     def generate_text(self, text, new_tokens):
-        tokens = tokenizer.encode(text)
-        tokens = torch.tensor(tokens).unsqueeze(0).to(next(self.parameters()).device)
-        return tokenizer.decode(MambaLM.generate(self, tokens, new_tokens)[0])
+        output = tokenizer.encode(text, return_tensors="pt", padding=True, truncation=True, padding_side="left", max_length=512)
+        # Squeeze to remove batch dimension added by tokenizer
+        output = output.squeeze(0)
+        # tokens = torch.tensor(tokens).unsqueeze(0).to(next(self.parameters()).device)
+        padding_length = 512 - output.size(0)
+        padding = torch.full((padding_length,), tokenizer.pad_token_id)
+        tokens = torch.cat([padding, output], dim=0).to(next(self.parameters()).device)
+
+        return tokenizer.decode(MambaLM.generate(self, tokens[None, :], new_tokens)[0][padding_length:])
 
 # %% [markdown]
 # # Get Data
@@ -577,10 +577,13 @@ if debug:
 # special_print(f"Loaded dataloader with {len(dataloader)} batches", accelerator)
 
 # %%
-def special_print(my_str, accelerator):
+def special_print(my_str, accelerator, start_time):
     if accelerator.is_main_process:
         print(my_str)
-        print_time()
+        elapsed = time.time() - start_time
+        minutes = int(elapsed // 60)
+        seconds = int(elapsed % 60)
+        print(f"Elapsed time: {minutes:02d}:{seconds:02d}")
 
 def print_time():
     from datetime import datetime
@@ -593,29 +596,22 @@ vocab_size = tokenizer.vocab_size
 glob_wandb_on = True
 
 def training_function():
+    start_time = time.time()
     accelerator = Accelerator()
-    special_print("Accelerator initialized", accelerator)
+    special_print("Accelerator initialized", accelerator, start_time)
     is_main_process = accelerator.is_main_process
-    if is_main_process:
+    if is_main_process and glob_wandb_on:
         wandb.login(key=os.getenv("WANDB_API_KEY"))
-        wandb.init(project="monoscripts-mamba")
+        wandb.init(project="monoscripts-mamba", config={"lr": 0.0001, "n_layers": 12, "n_heads": 12, "d_model": 768, "d_state": 64, "d_conv": 4, "expand": 2, "epochs": 1})
+        special_print("Wandb initialized", accelerator, start_time)
 
     dataloader = get_dataloader(4, accelerator)
-    special_print(f"Loaded dataloader with {len(dataloader)} batches", accelerator)
+    special_print(f"Loaded dataloader with total {len(dataloader)} batches", accelerator, start_time)
     for batch in dataloader:
         tokens_per_batch = batch.numel()
         break
     num_tokens = len(dataloader) * tokens_per_batch
-    special_print(f"Number of tokens: {num_tokens}", accelerator)
-    
-    # model = MambaLM(vocab_size, 
-    #             n_layers=12,
-    #             n_heads=6,
-    #             d_model=192,
-    #             d_state=32,
-    #             d_conv=4,
-    #             expand=2,
-    #             )
+    special_print(f"Number of tokens: {num_tokens}", accelerator, start_time)
 
     model = MambaLM(vocab_size, 
                 n_layers=12,
@@ -626,20 +622,19 @@ def training_function():
                 expand=2,
                 )
     
-    special_print(f"Model params: {num_params(model)}", accelerator)
-    special_print(f"Token:params ratio: {num_tokens / num_params(model)}", accelerator)
+    special_print(f"Model params: {num_params(model)}", accelerator, start_time)
+    special_print(f"Token:params ratio: {num_tokens / num_params(model)}", accelerator, start_time)
 
-    optimizer = torch.optim.AdamW(model.parameters(), betas=(0.9, 0.95), weight_decay=0.1, lr=0.00002)
-    # optimizer = torch.optim.SGD(model.parameters(), lr=0.001)
+    optimizer = torch.optim.AdamW(model.parameters(), betas=(0.9, 0.95), weight_decay=0.1, lr=0.0001)
     epochs = 1
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=len(dataloader) / 8 * epochs)
 
     model, dataloader, optimizer, scheduler = accelerator.prepare(model, dataloader, optimizer, scheduler)
-    special_print("Prepared with Accelerator", accelerator)
+    special_print("Prepared with Accelerator", accelerator, start_time)
     model = torch.compile(model)
-    special_print("Model compiled", accelerator)
+    special_print("Model compiled", accelerator, start_time)
     
-    if is_main_process:
+    if is_main_process and glob_wandb_on:
         wandb.watch(model)
 
     MambaLM.train(model, dataloader, optimizer, scheduler, epochs, accelerator, enable_wandb=is_main_process and glob_wandb_on)
@@ -671,16 +666,38 @@ torch.set_float32_matmul_precision('high')
 
 # %%
 nb_parallelize = False
+test_generate = False
 
 if __name__ == '__main__':
     # Check if we're running in a notebook or regular Python script
-    if is_in_notebook():
-        if nb_parallelize:
-            notebook_launcher(training_function, num_processes=8)
+    if not test_generate:
+        if is_in_notebook():
+            if nb_parallelize:
+                notebook_launcher(training_function, num_processes=8)
+            else:
+                notebook_launcher(training_function, num_processes=1)
         else:
-            notebook_launcher(training_function, num_processes=1)
+            training_function()
     else:
-        training_function()
+        test_model = MambaLM(vocab_size, 
+                    n_layers=12,
+                    n_heads=12,
+                    d_model=768,
+                    d_state=64,
+                    d_conv=4,
+                    expand=2,
+                ).to('cuda')
+        # mamba_lm_tensors = torch.load("my_fsdp_fp32_model.pt", weights_only=True)
+        mamba_lm_tensors = torch.load("mamba_lm.pt", weights_only=True)
+        # print(mamba_lm_tensors.keys())
+        for key in mamba_lm_tensors.keys():
+            assert key.startswith("_orig_mod.module."), f"Key {key} does not start with '_orig_mod.module.'"
+        mamba_lm_tensors = {key.replace('_orig_mod.module.', ''): tensor for key, tensor in mamba_lm_tensors.items()}
+        test_model.load_state_dict(mamba_lm_tensors)
+        while True:
+            text = input("Enter text: ")
+            # num_tokens = int(input("Enter number of tokens: "))
+            print(test_model.generate_text(text, 10))
 
 # %%
 print("Model params", num_params(model))

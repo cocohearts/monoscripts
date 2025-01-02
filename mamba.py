@@ -526,7 +526,7 @@ class MambaLM(nn.Module):
             print(f"Best loss: {best_loss:0.4f}")
                     
             
-    def generate(self, x: Int[Tensor, "batch position"], new_tokens: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def generate(self, x: Int[Tensor, "batch position"], new_tokens: int, temperature=None) -> Tuple[torch.Tensor, torch.Tensor]:
         seq_conv_len = self.layers[0].Heads[0].conv.kernel_size[0]
         # print(f"Sequence convolution length: {seq_conv_len}")
         returned = x
@@ -540,11 +540,15 @@ class MambaLM(nn.Module):
             pos_shift = min(400, returned.shape[1]) - seq_conv_len
             # pos_shift = 100
             out = self.forward(next_inputs, keep_hidden=True, use_hidden=True, position_shift=pos_shift)
-            next_token = out[:, -1].argmax(dim=-1)[None, :]
+            if temperature is not None:
+                out = out / temperature
+                next_token = torch.multinomial(torch.softmax(out[:, -1], dim=-1), num_samples=1)
+            else:
+                next_token = out[:, -1].argmax(dim=-1)[None, :]
             returned = torch.cat([returned, next_token], dim=1)
         return returned
 
-    def generate_text(self, text, new_tokens):
+    def generate_text(self, text, new_tokens, temperature=None):
         output = tokenizer.encode(text, return_tensors="pt", padding=True, truncation=True, padding_side="left", max_length=512)
         # Squeeze to remove batch dimension added by tokenizer
         output = output.squeeze(0)
@@ -555,7 +559,7 @@ class MambaLM(nn.Module):
         tokens = torch.cat([padding, output], dim=0).to(next(self.parameters()).device)
         tokens = output.to(next(self.parameters()).device)
 
-        return tokenizer.decode(MambaLM.generate(self, tokens[None, :], new_tokens)[0][padding_length:])
+        return tokenizer.decode(MambaLM.generate(self, tokens[None, :], new_tokens, temperature)[0][padding_length:])
 
 # %% [markdown]
 # # Get Data
@@ -707,10 +711,17 @@ if __name__ == '__main__':
         mamba_lm_tensors = {key.replace('_orig_mod.module.', ''): tensor for key, tensor in mamba_lm_tensors.items()}
         test_model.load_state_dict(mamba_lm_tensors)
         while True:
-            text = input("Enter text: ")
-            num_tokens = 10
-            num_tokens = int(input("Enter number of tokens: "))
-            print(test_model.generate_text(text, num_tokens))
+            new_text = input("Enter text [blank to repeat]: ")
+            if new_text != "":
+                text = new_text
+                num_tokens = 10
+                num_tokens = int(input("Enter number of tokens: "))
+                temperature = input("Enter temperature [blank for greedy]: ")
+                if temperature == "":
+                    temperature = None
+                else:
+                    temperature = float(temperature)
+            print(test_model.generate_text(text, num_tokens, temperature))
 
 # %%
 print("Model params", num_params(model))

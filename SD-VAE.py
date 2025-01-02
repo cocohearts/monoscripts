@@ -494,7 +494,7 @@ def training_function():
     enable_gan = True
     lr = 1e-3
     disc_lr = 1e-4
-    epochs = 512
+    epochs = 1024
     inner_channels = 48
     batch_size = 128
     is_main_process = accelerator.is_main_process

@@ -282,10 +282,10 @@ Conv structure:
 """
 
 class SANA_VAE(nn.Module):
-    def __init__(self):
+    def __init__(self, inner_channels=32):
         super().__init__()
-        self.encoder = SANA_Encoder()
-        self.decoder = SANA_Decoder()
+        self.encoder = SANA_Encoder(inner_channels)
+        self.decoder = SANA_Decoder(inner_channels)
         self.discriminator = SANA_Discriminator()
     
     def split_code(self, x):
@@ -367,6 +367,8 @@ class SANA_VAE(nn.Module):
             wandb.log({"l2_loss": gathered_l2_loss.mean().item()})
             wandb.log({"mu_squared": gathered_mu_norm.item()})
             wandb.log({"logvar": gathered_logvar.item()})
+            wandb.log({"learning_rate": scheduler.get_last_lr()[0]})
+            wandb.log({"gan_coefficient": gan_coeff})
 
         if teach_gan:
             gathered_gan_loss = accelerator.gather(gan_loss)
@@ -484,20 +486,32 @@ def training_function():
     start_time = time.time()
     accelerator = Accelerator()
     special_print("Accelerator initialized", accelerator, start_time)
-    beta_viz = 1.0
+    beta_viz = 2.0
     beta_kl = 0.1
-    beta_l2 = 4.0
-    beta_gan = 1.0
+    beta_l2 = 20.0
+    beta_gan = .1
     enable_gan_cutoff = 0.7
     enable_gan = True
     lr = 1e-3
     disc_lr = 1e-4
     epochs = 256
-
+    inner_channels = 32
     is_main_process = accelerator.is_main_process
     if is_main_process and glob_wandb_on:
         wandb.login(key=os.getenv("WANDB_API_KEY"))
-        wandb.init(project="monoscripts-vae", config={"lr": lr, "beta_viz": beta_viz, "beta_kl": beta_kl, "beta_l2": beta_l2, "disc_lr": disc_lr, "enable_gan_cutoff": enable_gan_cutoff, "epochs": epochs, "enable_gan": enable_gan, "beta_gan": beta_gan, "super_compress": True})
+        wandb.init(project="monoscripts-vae", config={
+            "lr": lr,
+            "beta_viz": beta_viz,
+            "beta_kl": beta_kl,
+            "beta_l2": beta_l2,
+            "disc_lr": disc_lr,
+            "enable_gan_cutoff": enable_gan_cutoff,
+            "epochs": epochs,
+            "enable_gan": enable_gan,
+            "beta_gan": beta_gan,
+            "super_compress": True,
+            "inner_channels": inner_channels
+        })
         special_print("Wandb initialized", accelerator, start_time)
 
     dataloader, _ = get_dataloader(batch_size=160)

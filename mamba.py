@@ -99,7 +99,16 @@ def get_dataloader(batch_size=16, accelerator=None):
         dataset = load_dataset("DKYoon/SlimPajama-6B", cache_dir="/shared/alex-zhao-storage/hf-cache", split="train", download_config=DownloadConfig(disable_tqdm=True))
     else:
         dataset = load_dataset("DKYoon/SlimPajama-6B", cache_dir="/shared/alex-zhao-storage/hf-cache", split="train")
-    return DataLoader(TextDataset(dataset['text'], tokenizer), batch_size=batch_size, num_workers=0)
+    # sampler = torch.utils.data.SequentialSampler(dataset)
+    return DataLoader(
+        TextDataset(dataset['text'], tokenizer),
+        batch_size=batch_size,
+        # num_workers=8,
+        # pin_memory=True,
+        # prefetch_factor=2,
+        # persistent_workers=True,
+        # sampler=sampler
+    )
 
 # %%
 if debug:
@@ -255,22 +264,17 @@ class SSM(nn.Module):
             if torch.isnan(y).any() or torch.isinf(y).any():
                 raise ValueError("NaN or Inf values detected in SSM output")
         else:
-            if use_hidden:
-                h = self.h
-            else:
-                h = torch.zeros(x.shape[0], self.d_model, self.d_state).to(x.device)
-            y = torch.zeros_like(x).to(x.device)
-            for index in range(x.shape[1]):
-                if index == 0:
-                    h = B_bar[:, index] * x[:, index].view(-1, self.d_model, 1)
-                else:
-                    h = A_bar[:, index] * h + B_bar[:, index] * x[:, index].view(-1, self.d_model, 1)
-                y[:, index] = torch.matmul(h, C[:, index, :, None]).squeeze(-1)
+            assert(use_hidden)
+            h = self.h
+            assert(h.shape[1]+1 == C.shape[1])
+            new_h = A_bar[:, -1] * h[:, -1] + B_bar[:, -1] * x[:, -1].view(-1, self.d_model, 1)
+            h = torch.cat([h, new_h[:, None]], dim=1)
+            y = torch.matmul(h, C[..., None]).squeeze(-1)
 
         if torch.isnan(y).any() or torch.isinf(y).any():
             raise ValueError("NaN or Inf values detected in SSM output")
         if keep_hidden:
-            self.h = h[:, -1:]
+            self.h = h[:, -3:]
         return y
 
     def device(self):
@@ -384,17 +388,17 @@ class MambaLayer(nn.Module):
             raise ValueError("NaN or Inf values detected in MambaLayer forward")
         return x
     
-    def generate(self, x: Float[Tensor, "batch position d_model"], new_tokens: int):
-        normed_x = self.rms_norm(x)
+    # def generate(self, x: Float[Tensor, "batch position d_model"], new_tokens: int):
+    #     normed_x = self.rms_norm(x)
         
-        out = self.forward(normed_x, keep_hidden=True)
-        head_outputs = torch.zeros(x.shape).to(x.device)
-        for head in self.Heads:
-            head_outputs += head.generate(normed_x, new_tokens)
-        x = x + self.layer_norm(self.out_project(head_outputs))
-        if torch.isnan(x).any() or torch.isinf(x).any():
-            raise ValueError("NaN or Inf values detected in MambaLayer forward")
-        return x
+    #     out = self.forward(normed_x, keep_hidden=True)
+    #     head_outputs = torch.zeros(x.shape).to(x.device)
+    #     for head in self.Heads:
+    #         head_outputs += head.generate(normed_x, new_tokens)
+    #     x = x + self.layer_norm(self.out_project(head_outputs))
+    #     if torch.isnan(x).any() or torch.isinf(x).any():
+    #         raise ValueError("NaN or Inf values detected in MambaLayer forward")
+    #     return x
 
 # %%
 class FFN(nn.Module):
@@ -412,7 +416,7 @@ class FFN(nn.Module):
 
 # %%
 class MambaLM(nn.Module):
-    def __init__(self, vocab_size, n_layers, n_heads, d_model, d_state, d_conv, expand, context_len=600):
+    def __init__(self, vocab_size, n_layers, n_heads, d_model, d_state, d_conv, expand, context_len=1000):
         super().__init__()
 
         self.vocab_size = vocab_size
@@ -434,9 +438,9 @@ class MambaLM(nn.Module):
         self.layers = nn.ModuleList([MambaLayer(n_heads, d_model, d_state, d_conv, expand) for _ in range(n_layers)])
         self.output_layer = nn.Linear(d_model, self.vocab_size)
 
-    def forward(self, x: torch.Tensor, keep_hidden=False, use_hidden=False) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor, keep_hidden=False, use_hidden=False, position_shift=0) -> Tuple[torch.Tensor, torch.Tensor]:
         x = self.embedding(x)
-        x = x + self.pos_embedding(torch.arange(x.shape[1]).expand(x.shape[0], -1).to(next(self.parameters()).device))
+        x = x + self.pos_embedding(torch.arange(x.shape[1]).expand(x.shape[0], -1).to(next(self.parameters()).device) + position_shift)
         if x.isnan().any() or x.isinf().any():
             raise ValueError("NaN or Inf values detected in MambaLM input")
         for layer in self.layers:
@@ -522,14 +526,19 @@ class MambaLM(nn.Module):
                     
             
     def generate(self, x: Int[Tensor, "batch position"], new_tokens: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        seq_conv_len = self.layers[0].Heads[0].conv.kernel_size[0]
+        print(f"Sequence convolution length: {seq_conv_len}")
         returned = x
 
         out = self.forward(x, keep_hidden=True)
         next_token = out[:, -1].argmax(dim=-1)[None, :]
         returned = torch.cat([returned, next_token], dim=1)
 
-        for _ in range(new_tokens-1):
-            out = self.forward(next_token, keep_hidden=True, use_hidden=True)
+        for _ in tqdm(range(new_tokens-1), desc="Generating tokens"):
+            next_inputs = returned[:, -seq_conv_len:]
+            # pos_shift = min(400, returned.shape[1]) - seq_conv_len
+            pos_shift = 100
+            out = self.forward(next_inputs, keep_hidden=True, use_hidden=True, position_shift=pos_shift)
             next_token = out[:, -1].argmax(dim=-1)[None, :]
             returned = torch.cat([returned, next_token], dim=1)
         return returned
@@ -541,7 +550,8 @@ class MambaLM(nn.Module):
         # tokens = torch.tensor(tokens).unsqueeze(0).to(next(self.parameters()).device)
         padding_length = 512 - output.size(0)
         padding = torch.full((padding_length,), tokenizer.pad_token_id)
-        tokens = torch.cat([padding, output], dim=0).to(next(self.parameters()).device)
+        # tokens = torch.cat([padding, output], dim=0).to(next(self.parameters()).device)
+        tokens = output.to(next(self.parameters()).device)
 
         return tokenizer.decode(MambaLM.generate(self, tokens[None, :], new_tokens)[0][padding_length:])
 
@@ -666,7 +676,7 @@ torch.set_float32_matmul_precision('high')
 
 # %%
 nb_parallelize = False
-test_generate = False
+test_generate = True
 
 if __name__ == '__main__':
     # Check if we're running in a notebook or regular Python script
@@ -696,8 +706,9 @@ if __name__ == '__main__':
         test_model.load_state_dict(mamba_lm_tensors)
         while True:
             text = input("Enter text: ")
-            # num_tokens = int(input("Enter number of tokens: "))
-            print(test_model.generate_text(text, 10))
+            num_tokens = 10
+            num_tokens = int(input("Enter number of tokens: "))
+            print(test_model.generate_text(text, num_tokens))
 
 # %%
 print("Model params", num_params(model))

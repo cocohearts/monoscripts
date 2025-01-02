@@ -1,13 +1,12 @@
 #!/bin/bash
 #SBATCH --job-name=accelerate_launch
-#SBATCH --nodes=2
+#SBATCH --nodes=1
 #SBATCH --gres=gpu:8             # Request 8 GPUs
 #SBATCH --time=60:00:00          # Set a 60-hour time limit
 #SBATCH --cpus-per-task=80
 #SBATCH --partition=main  # Replace with the appropriate partition name
 #SBATCH --output=slurm_logs/mamba_%j.out
 #SBATCH --error=slurm_logs/mamba_%j.err
-#SBATCH --nodelist=worker-20,worker-55
 
 # Load necessary modules
 # module load python
@@ -27,5 +26,11 @@ head_node_ip=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1)
 echo "Head node IP: $head_node_ip"
 
 # Run your accelerate launch command
-srun accelerate launch --num_processes $((SLURM_NNODES * GPUS_PER_NODE)) --num_machines  $SLURM_NNODES --rdzv_backend c10d --main_process_ip $head_node_ip --main_process_port 29502 mamba.py
+srun accelerate launch \
+    mamba.py
 
+    # --num_processes $((SLURM_NNODES * GPUS_PER_NODE)) \
+    # --num_machines $SLURM_NNODES \
+    # --rdzv_backend c10d \
+    # --main_process_ip $head_node_ip \
+    # --main_process_port 29502 \

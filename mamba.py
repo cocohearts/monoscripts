@@ -340,6 +340,7 @@ class Mamba(nn.Module):
         d_head = expand * d_state
         self.upscale = nn.Linear(d_model, d_head)
         self.gate = nn.Linear(d_model, d_head)
+        # TODO: change groups to be smaller
         self.conv = nn.Conv1d(d_head, d_head, d_conv, padding=d_conv-1, groups=d_head)
         self.ssm = SSM(d_head, d_state)
         self.downscale = nn.Linear(d_head, d_model)
@@ -527,7 +528,7 @@ class MambaLM(nn.Module):
             
     def generate(self, x: Int[Tensor, "batch position"], new_tokens: int) -> Tuple[torch.Tensor, torch.Tensor]:
         seq_conv_len = self.layers[0].Heads[0].conv.kernel_size[0]
-        print(f"Sequence convolution length: {seq_conv_len}")
+        # print(f"Sequence convolution length: {seq_conv_len}")
         returned = x
 
         out = self.forward(x, keep_hidden=True)
@@ -536,8 +537,8 @@ class MambaLM(nn.Module):
 
         for _ in tqdm(range(new_tokens-1), desc="Generating tokens"):
             next_inputs = returned[:, -seq_conv_len:]
-            # pos_shift = min(400, returned.shape[1]) - seq_conv_len
-            pos_shift = 100
+            pos_shift = min(400, returned.shape[1]) - seq_conv_len
+            # pos_shift = 100
             out = self.forward(next_inputs, keep_hidden=True, use_hidden=True, position_shift=pos_shift)
             next_token = out[:, -1].argmax(dim=-1)[None, :]
             returned = torch.cat([returned, next_token], dim=1)
@@ -549,8 +550,9 @@ class MambaLM(nn.Module):
         output = output.squeeze(0)
         # tokens = torch.tensor(tokens).unsqueeze(0).to(next(self.parameters()).device)
         padding_length = 512 - output.size(0)
+        padding_length = 0
         padding = torch.full((padding_length,), tokenizer.pad_token_id)
-        # tokens = torch.cat([padding, output], dim=0).to(next(self.parameters()).device)
+        tokens = torch.cat([padding, output], dim=0).to(next(self.parameters()).device)
         tokens = output.to(next(self.parameters()).device)
 
         return tokenizer.decode(MambaLM.generate(self, tokens[None, :], new_tokens)[0][padding_length:])

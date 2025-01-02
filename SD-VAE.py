@@ -67,7 +67,7 @@ def get_dataloader(batch_size=256):
     dataloader = DataLoader(dataset, 
                         batch_size=batch_size,
                         shuffle=False,
-                        num_workers=8,
+                        num_workers=16,
                         pin_memory=True,
                         prefetch_factor=2,
                         persistent_workers=True,
@@ -192,34 +192,54 @@ class ResConvTransposeBlock(nn.Module):
 
 # %%
 class SANA_Encoder(nn.Module):
-    def __init__(self):
+    def __init__(self, final_channel=32):
         super().__init__()
-        self.channels = [3, 12, 24, 48, 96, 192]
-        self.output_widths = [256, 128, 64, 32, 16, 8]
-        self.depths = [40, 20, 10, 10, 10]
+        self.hidden_channels = [32, 64, 128, 256, 512, 1024]
+        self.widths = [256, 128, 64, 32, 16, 8]
+        self.depths = [3, 3, 3, 3, 3]
+        self.kernel_sizes = [11, 7, 5, 3, 3]
+        self.strides = [2, 2, 2, 2, 2]
+        self.paddings = [k//2 for k in self.kernel_sizes]
+
         self.activation = nn.LeakyReLU(0.2)
+
+        self.up_proj = nn.Conv2d(3, self.hidden_channels[0], 1, stride=1, padding=0)
+        self.down_proj = nn.Conv2d(self.hidden_channels[-1], 2 * final_channel, 1, stride=1, padding=0)
+
         self.layers = nn.Sequential(
-            *[ResConvBlock(self.channels[index], self.channels[index+1], self.output_widths[index+1], kernel_size, stride, padding, activation=self.activation, depth=self.depths[index])
-              for index, kernel_size, stride, padding in zip(range(len(kernel_sizes)), kernel_sizes, strides, paddings)]
+            *[ResConvBlock(self.hidden_channels[index], self.hidden_channels[index+1], self.widths[index+1], self.kernel_sizes[index], self.strides[index], self.paddings[index], activation=self.activation, depth=self.depths[index])
+              for index in range(len(self.kernel_sizes))]
         )
 
     def forward(self, x):
-        return self.layers(x)
+        x = self.activation(self.up_proj(x))
+        x = self.layers(x)
+        x = self.down_proj(x)
+        return x
 
 class SANA_Decoder(nn.Module):
-    def __init__(self):
+    def __init__(self, final_channel=32):
         super().__init__()
-        self.channels = [3, 6, 12, 24, 48, 96]
+        self.hidden_channels = [32, 64, 128, 256, 512, 1024]
         self.output_widths = [256, 128, 64, 32, 16, 8]
-        self.depths = [40, 20, 10, 10, 10, 10]
+        self.depths = [3, 3, 3, 3, 3]
+        self.kernel_sizes = [11, 7, 5, 3, 3]
+        self.strides = [2, 2, 2, 2, 2]
+        self.paddings = [k//2 for k in self.kernel_sizes]
         self.activation = nn.LeakyReLU(0.2)
+        
+        self.up_proj = nn.Conv2d(final_channel, self.hidden_channels[-1], 1, stride=1, padding=0)
         self.layers = nn.Sequential(
-            *[ResConvTransposeBlock(self.channels[index+1], self.channels[index], self.output_widths[index], kernel_size, stride, padding, activation=self.activation, depth=self.depths[index])
+            *[ResConvTransposeBlock(self.hidden_channels[index+1], self.hidden_channels[index], self.output_widths[index], kernel_size, stride, padding, activation=self.activation, depth=self.depths[index])
               for index, kernel_size, stride, padding in zip(range(len(kernel_sizes)), kernel_sizes, strides, paddings)][::-1]
         )
+        self.down_proj = nn.Conv2d(self.hidden_channels[0], 3, 1, stride=1, padding=0)
 
     def forward(self, x):
-        return self.layers(x)
+        x = self.activation(self.up_proj(x))
+        x = self.layers(x)
+        x = self.down_proj(x)
+        return x
 
 # %%
 class SANA_Discriminator(nn.Module):
@@ -472,7 +492,7 @@ def training_function():
     enable_gan = True
     lr = 1e-3
     disc_lr = 1e-4
-    epochs = 128
+    epochs = 256
 
     is_main_process = accelerator.is_main_process
     if is_main_process and glob_wandb_on:
@@ -480,7 +500,7 @@ def training_function():
         wandb.init(project="monoscripts-vae", config={"lr": lr, "beta_viz": beta_viz, "beta_kl": beta_kl, "beta_l2": beta_l2, "disc_lr": disc_lr, "enable_gan_cutoff": enable_gan_cutoff, "epochs": epochs, "enable_gan": enable_gan, "beta_gan": beta_gan, "super_compress": True})
         special_print("Wandb initialized", accelerator, start_time)
 
-    dataloader, _ = get_dataloader(batch_size=256)
+    dataloader, _ = get_dataloader(batch_size=160)
     special_print("Loaded dataloader", accelerator, start_time)
 
     clip_model, resize = get_clip_model(device=accelerator.device)

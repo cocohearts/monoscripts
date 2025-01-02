@@ -1,1 +1,6 @@
 .env
+**.pt
+slurm_logs/
+test_imgs/
+wandb/
+

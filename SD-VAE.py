@@ -194,7 +194,7 @@ class ResConvTransposeBlock(nn.Module):
 class SANA_Encoder(nn.Module):
     def __init__(self, final_channel=32):
         super().__init__()
-        self.hidden_channels = [32, 64, 128, 256, 512, 1024]
+        self.hidden_channels = [48, 96, 192, 384, 768, 1536]
         self.widths = [256, 128, 64, 32, 16, 8]
         self.depths = [3, 3, 3, 3, 3]
         self.kernel_sizes = [11, 7, 5, 3, 3]
@@ -220,7 +220,7 @@ class SANA_Encoder(nn.Module):
 class SANA_Decoder(nn.Module):
     def __init__(self, final_channel=32):
         super().__init__()
-        self.hidden_channels = [32, 64, 128, 256, 512, 1024]
+        self.hidden_channels = [48, 96, 192, 384, 768, 1536]
         self.output_widths = [256, 128, 64, 32, 16, 8]
         self.depths = [3, 3, 3, 3, 3]
         self.kernel_sizes = [11, 7, 5, 3, 3]
@@ -494,32 +494,38 @@ def training_function():
     enable_gan = True
     lr = 1e-3
     disc_lr = 1e-4
-    epochs = 256
-    inner_channels = 32
+    epochs = 512
+    inner_channels = 48
+    batch_size = 128
     is_main_process = accelerator.is_main_process
     if is_main_process and glob_wandb_on:
         wandb.login(key=os.getenv("WANDB_API_KEY"))
-        wandb.init(project="monoscripts-vae", config={
-            "lr": lr,
-            "beta_viz": beta_viz,
-            "beta_kl": beta_kl,
-            "beta_l2": beta_l2,
-            "disc_lr": disc_lr,
-            "enable_gan_cutoff": enable_gan_cutoff,
-            "epochs": epochs,
-            "enable_gan": enable_gan,
-            "beta_gan": beta_gan,
-            "super_compress": True,
-            "inner_channels": inner_channels
-        })
+        wandb.init(
+            project="monoscripts-vae",
+            settings=wandb.Settings(init_timeout=1200),
+            config={
+                "lr": lr,
+                "beta_viz": beta_viz,
+                "beta_kl": beta_kl,
+                "beta_l2": beta_l2,
+                "disc_lr": disc_lr,
+                "enable_gan_cutoff": enable_gan_cutoff,
+                "epochs": epochs,
+                "enable_gan": enable_gan,
+                "beta_gan": beta_gan,
+                "super_compress": True,
+                "inner_channels": inner_channels,
+                "batch_size": batch_size
+            }
+        )
         special_print("Wandb initialized", accelerator, start_time)
 
-    dataloader, _ = get_dataloader(batch_size=160)
+    dataloader, _ = get_dataloader(batch_size=batch_size)
     special_print("Loaded dataloader", accelerator, start_time)
 
     clip_model, resize = get_clip_model(device=accelerator.device)
 
-    model = SANA_VAE()
+    model = SANA_VAE(inner_channels=inner_channels)
     special_print(f"Number of parameters: {num_params(model)}", accelerator, start_time)
     optimizer = torch.optim.Adam(list(model.encoder.parameters()) + list(model.decoder.parameters()), lr=1e-3, betas=(0.9, 0.99))
     disc_optimizer = torch.optim.Adam(model.discriminator.parameters(), lr=1e-4, betas=(0.9, 0.99))

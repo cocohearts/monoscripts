@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=accelerate_launch
-#SBATCH --nodes=4
+#SBATCH --nodes=8
 #SBATCH --gres=gpu:8             # Request 8 GPUs
 #SBATCH --time=60:00:00          # Set a 60-hour time limit
 #SBATCH --cpus-per-task=80
